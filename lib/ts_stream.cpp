@@ -694,6 +694,10 @@ namespace TS{
       }
     }
     if (thisCodec == ID3 || thisCodec == AC3 || thisCodec == MP2 || thisCodec == META){
+      // An empty PES carries nothing to keep. genericFill() refuses a non-NULL pointer with
+      // size 0 and leaves a NULL packet in the queue, which ends MistInTSSRT with
+      // "internal TS parser error" -- skip it instead.
+      if (!realPayloadSize){return;}
       out.push_back(DTSC::Packet());
       out.back().genericFill(timeStamp, timeOffset, tid, pesPayload, realPayloadSize, bPos, 0);
       if (thisCodec == MP2 && !mp2Hdr.count(tid)){
@@ -704,10 +708,20 @@ namespace TS{
       //Ignore if invalid
       if (realPayloadSize < 2){return;}
       out.push_back(DTSC::Packet());
-      //Skip the first two bytes
-      out.back().genericFill(timeStamp, timeOffset, tid, pesPayload+2, realPayloadSize-2, bPos, 0);
+      //Skip the first two bytes (big-endian length of the JSON data that follows)
+      if (realPayloadSize == 2){
+        // Zero-length JSON packet: the TS output writes one for every empty JSON packet in the
+        // source buffer (an RTMP AMF data message with nothing to convert becomes one on the
+        // RTMP input). genericFill() refuses a non-NULL pointer with size 0 and leaves a NULL
+        // packet behind, which ends MistInTSSRT with "internal TS parser error" on every such
+        // PES. A NULL pointer with size 0 builds a valid empty packet: the packet the sender had.
+        out.back().genericFill(timeStamp, timeOffset, tid, 0, 0, bPos, 0);
+      }else{
+        out.back().genericFill(timeStamp, timeOffset, tid, pesPayload+2, realPayloadSize-2, bPos, 0);
+      }
     }
     if (thisCodec == PCM) {
+      if (!realPayloadSize){return;}
       out.push_back(DTSC::Packet());
       out.back().genericFill(timeStamp, timeOffset, tid, pesPayload, realPayloadSize, bPos, 0);
     }
