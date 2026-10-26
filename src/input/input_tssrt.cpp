@@ -45,6 +45,8 @@ namespace Mist{
     srtConn = 0;
     lastRawPacket = 0;
     bootMSOffsetCalculated = false;
+    idleTimeout = 0;
+    lastRecvMs = 0;
     assembler.setLive();
     capa["name"] = "TSSRT";
     capa["desc"] = "This input allows for processing MPEG2-TS-based SRT streams using libsrt " SRT_VERSION_STRING ".";
@@ -117,6 +119,22 @@ namespace Mist{
       option["help"] = "Enable raw MPEG-TS passthrough mode";
       config->addOption("raw", option);
 
+      option.null();
+      option["arg"] = "integer";
+      option["long"] = "idletimeout";
+      option["short"] = "I";
+      option["help"] = "Close the SRT connection and exit when no bytes were received for this many ms (0 = never)";
+      option["value"].append(10000);
+      config->addOption("idletimeout", option);
+      capa["optional"]["idletimeout"]["name"] = "Idle timeout (ms)";
+      capa["optional"]["idletimeout"]["help"] =
+        "If no bytes arrive over the SRT connection for this many milliseconds, the connection is "
+        "closed and the input exits so it can be restarted cleanly. Protects against a remote that "
+        "keeps the SRT session alive but never sends media. 0 disables the check.";
+      capa["optional"]["idletimeout"]["option"] = "--idletimeout";
+      capa["optional"]["idletimeout"]["type"] = "uint";
+      capa["optional"]["idletimeout"]["default"] = 10000;
+
       capa["optional"]["datatrack"]["name"] = "MPEG Data track parser";
       capa["optional"]["datatrack"]["help"] = "Which parser to use for data tracks";
       capa["optional"]["datatrack"]["type"] = "select";
@@ -152,10 +170,22 @@ namespace Mist{
       }
       Util::sanitizeName(streamName);
       Util::setStreamName(streamName);
+      armIdleWatchdog();
     }
     lastTimeStamp = 0;
     timeStampOffset = 0;
     singularFlag = true;
+  }
+
+  /// Reads the idle timeout setting and configures the SRT socket so blocking reads return
+  /// periodically, which is what allows getNext() to notice a silent-but-connected remote.
+  void InputTSSRT::armIdleWatchdog(){
+    idleTimeout = config->getInteger("idletimeout");
+    lastRecvMs = Util::bootMS();
+    if (!idleTimeout || !srtConn || !*srtConn){return;}
+    // Wake up at least every second, or faster for short timeouts, so the check is timely.
+    uint64_t pollMs = idleTimeout < 1000 ? idleTimeout : 1000;
+    srtConn->setRecvTimeout(pollMs);
   }
 
   InputTSSRT::~InputTSSRT(){}
@@ -217,6 +247,7 @@ namespace Mist{
         ++connectCnt;
       }while (!*srtConn && connectCnt < 10);
       if (!*srtConn){WARN_MSG("Connecting to %s timed out", u.getUrl().c_str());}
+      armIdleWatchdog();
     }
     return true;
   }
@@ -229,6 +260,7 @@ namespace Mist{
 
       size_t recvSize = srtConn->RecvNow();
       if (recvSize){
+        lastRecvMs = Util::bootMS();
         if (rawMode){
           keepAlive();
           rawBuffer.append(srtConn->recvbuf, recvSize);
@@ -250,8 +282,15 @@ namespace Mist{
         }
         if (assembler.assemble(tsStream, srtConn->recvbuf, recvSize, true)){hasPacket = tsStream.hasPacket();}
       }else if (srtConn && *srtConn){
-        // This should not happen as the SRT socket is read blocking and won't return until there is
-        // data. But if it does, wait before retry
+        // A zero-byte read on a still-connected socket means the receive timed out (or an
+        // asynchronous read found nothing). Check the idle watchdog before retrying, so a remote
+        // that keeps the SRT session alive without ever sending media cannot wedge us forever.
+        if (idleTimeout && Util::bootMS() > lastRecvMs + idleTimeout){
+          WARN_MSG("No data received over SRT for %" PRIu64 " ms (limit %" PRIu64 " ms) - closing connection", Util::bootMS() - lastRecvMs, idleTimeout);
+          Util::logExitReason(ER_CLEAN_INACTIVE, "SRT connection idle for %" PRIu64 " ms", Util::bootMS() - lastRecvMs);
+          srtConn->close();
+          break;
+        }
         Util::sleep(10);
       }
     }

@@ -46,6 +46,9 @@ namespace Mist{
     size_t rawIdx;
     uint64_t lastRawPacket;
     bool bootMSOffsetCalculated;
+    uint64_t idleTimeout; ///< Max ms without received bytes before the connection is considered dead (0 = disabled)
+    uint64_t lastRecvMs;  ///< Util::bootMS() of the last successful receive (or of connection establishment)
+    void armIdleWatchdog();
   };
 }// namespace Mist
 
