@@ -55,6 +55,7 @@ namespace Socket{
 
     void setBlocking(bool blocking); ///< Set this socket to be blocking (true) or nonblocking (false).
     bool isBlocking(); ///< Check if this socket is blocking (true) or nonblocking (false).
+    void setRecvTimeout(int ms); ///< Set a receive timeout in ms for blocking reads (0 = block indefinitely).
 
     bool readable();
     size_t RecvNow();

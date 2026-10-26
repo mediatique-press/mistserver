@@ -6,6 +6,10 @@
 #include <mist/timing.h>
 #include <mist/util.h>
 
+#include <dirent.h>
+#include <fstream>
+#include <unistd.h>
+
 const char * getStateString(uint8_t state){
   switch (state){
   case STRMSTAT_OFF: return "Stream is offline";
@@ -44,6 +48,48 @@ void nukeSem(const char * pagePattern){
   snprintf(pageName, NAME_BUFFER_SIZE, pagePattern, Util::streamName);
   IPC::semaphore sem(pageName, O_RDWR, ACCESSPERMS, 0, true);
   if (sem){sem.unlink();}
+}
+
+/// Scans /proc for MistIn* processes started with "-s <stream>" (the form Util::startInput uses)
+/// and adds their pids to checkPids. This is the fallback for when the pid pages in shared memory
+/// are missing or stale, in which case the regular detection below finds nothing to kill even
+/// though an input (typically a wedged pull process and its angel) is still running.
+void findInputsByCmdline(const std::string & stream, std::set<pid_t> & checkPids) {
+  DIR * d = opendir("/proc");
+  if (!d) { return; }
+  pid_t self = getpid();
+  struct dirent * ent;
+  while ((ent = readdir(d))) {
+    if (ent->d_name[0] < '0' || ent->d_name[0] > '9') { continue; }
+    pid_t pid = atoi(ent->d_name);
+    if (pid <= 1 || pid == self) { continue; }
+    std::ifstream f((std::string("/proc/") + ent->d_name + "/cmdline").c_str(), std::ios::binary);
+    if (!f) { continue; }
+    std::string raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (raw.empty()) { continue; }
+    // Split on NUL into argv
+    std::deque<std::string> argv;
+    size_t start = 0;
+    while (start < raw.size()) {
+      size_t end = raw.find('\0', start);
+      if (end == std::string::npos) { end = raw.size(); }
+      argv.push_back(raw.substr(start, end - start));
+      start = end + 1;
+    }
+    if (argv.empty()) { continue; }
+    std::string binName = argv[0];
+    size_t slash = binName.rfind('/');
+    if (slash != std::string::npos) { binName.erase(0, slash + 1); }
+    if (binName.substr(0, 6) != "MistIn") { continue; }
+    for (size_t i = 1; i + 1 < argv.size(); ++i) {
+      if ((argv[i] == "-s" || argv[i] == "--stream") && argv[i + 1] == stream) {
+        INFO_MSG("Found %s process %" PRIu64 " for stream %s via /proc scan", binName.c_str(), (uint64_t)pid, stream.c_str());
+        checkPids.insert(pid);
+        break;
+      }
+    }
+  }
+  closedir(d);
 }
 
 // Remove process that are no longer running from the process list
@@ -193,6 +239,16 @@ int main(int argc, char **argv){
     if (pid > 1) {
       Util::Procs::Stop(pid);
       checkPids.insert(pid);
+    }
+  }
+  { // Fallback: the pid pages may be gone while the processes are not. Scan /proc for inputs of this stream.
+    std::set<pid_t> scanned;
+    findInputsByCmdline(argv[1], scanned);
+    for (auto & P : scanned) {
+      if (!checkPids.count(P)) {
+        Util::Procs::Stop(P);
+        checkPids.insert(P);
+      }
     }
   }
   killProcesses(checkPids, "input");

@@ -327,6 +327,8 @@ namespace Socket{
         return 0;
       }
       if (err == SRT_EASYNCRCV){return 0;}
+      // Receive timeout (SRTO_RCVTIMEO) expired without data; not an error, the connection is still up
+      if (err == SRT_ETIMEOUT){return 0;}
       ERROR_MSG("Unable to receive data over socket: %s", srt_getlasterror_str());
       if (srt_getsockstate(sock) != SRTS_CONNECTED){close();}
       return 0;
@@ -408,6 +410,7 @@ namespace Socket{
     if (receivedBytes == -1){
       int err = srt_getlasterror(0);
       if (err == SRT_EASYNCRCV){return 0;}
+      if (err == SRT_ETIMEOUT){return 0;}
       if (err == SRT_ECONNLOST){
         INFO_MSG("SRT connection %d lost", sock);
         close();
@@ -624,6 +627,16 @@ namespace Socket{
   }
 
   bool SRTConnection::isBlocking(){return blocking;}
+
+  /// Sets the receive timeout for blocking reads. A timed-out read returns SRT_EASYNCRCV, which
+  /// Recv() and RecvNow() report as zero bytes without closing the connection. Pass 0 to block indefinitely (-1 in SRT terms).
+  void SRTConnection::setRecvTimeout(int ms) {
+    if (sock == INVALID_SRT_SOCKET) { return; }
+    int timeoutVal = ms > 0 ? ms : -1;
+    if (srt_setsockopt(sock, 0, SRTO_RCVTIMEO, &timeoutVal, sizeof timeoutVal) == -1) {
+      WARN_MSG("Could not set SRT receive timeout: %s", srt_getlasterror_str());
+    }
+  }
 
   void SRTConnection::handleConnectionParameters(const std::string &_host,
                                                  const std::map<std::string, std::string> &_params){
