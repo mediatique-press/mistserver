@@ -544,28 +544,50 @@ namespace TS{
       uint64_t timeStamp = 0;
       int64_t timeOffset = 0;
       uint64_t pesOffset = 9;           // mandatory headers
+      bool hasPts = false;
+      bool hasDts = false;
+      uint64_t pts = 0;
       if ((pesHeader[7] >> 6) & 0x02){// Check for PTS presence
-        timeStamp = decodePTS(pesHeader + pesOffset);
+        hasPts = true;
+        pts = decodePTS(pesHeader + pesOffset);
+        timeStamp = pts;
         pesOffset += 5;
         if (((pesHeader[7] & 0xC0) >> 6) & 0x01){// Check for DTS presence (yes, only if PTS present)
-          timeOffset = timeStamp;
+          hasDts = true;
           timeStamp = decodePTS(pesHeader + pesOffset);
           pesOffset += 5;
-          if (timeStamp > timeOffset){
-            WARN_MSG("TS packet invalid: DTS > PTS. Ignoring DTS value.");
-            timeStamp = timeOffset;
-          }else{
-            timeOffset -= timeStamp;
-          }
         }
       }
 
+      // Unwrap the 33-bit decode clock (DTS, or PTS when there is no DTS) first. This is the
+      // monotonic timeline of the track, so it is the only value that may advance rolloverCount.
       timeStamp += (rolloverCount[tid] * TS_PTS_ROLLOVER);
 
       if ((timeStamp < lastms[tid]) && ((timeStamp % TS_PTS_ROLLOVER) < 0.1 * TS_PTS_ROLLOVER) &&
           ((lastms[tid] % TS_PTS_ROLLOVER) > 0.9 * TS_PTS_ROLLOVER)){
         ++rolloverCount[tid];
         timeStamp += TS_PTS_ROLLOVER;
+      }
+
+      if (hasPts && hasDts){
+        // PTS runs ahead of DTS on streams with B-frames, so it crosses the 33-bit boundary a few
+        // frames before DTS does. Unwrap it against the already-unwrapped DTS: if the raw PTS
+        // landed far below it, it has rolled over one extra time. Comparing the raw 33-bit
+        // values instead (as before) flagged those frames as "DTS > PTS", dropped their DTS and
+        // used the wrapped PTS as decode time, which in turn tripped the rollover detector one
+        // frame early and left the track a full rollover period (26.5h) ahead of the others for
+        // the rest of the session.
+        pts += (rolloverCount[tid] * TS_PTS_ROLLOVER);
+        if ((pts < timeStamp) && ((pts % TS_PTS_ROLLOVER) < 0.1 * TS_PTS_ROLLOVER) &&
+            ((timeStamp % TS_PTS_ROLLOVER) > 0.9 * TS_PTS_ROLLOVER)){
+          pts += TS_PTS_ROLLOVER;
+        }
+        if (timeStamp > pts){
+          WARN_MSG("TS packet invalid: DTS > PTS (%" PRIu64 " > %" PRIu64 "). Ignoring DTS value.", timeStamp, pts);
+          timeStamp = pts;
+        }else{
+          timeOffset = pts - timeStamp;
+        }
       }
 
       if (pesHeader[7] & 0x20){// ESCR - ignored

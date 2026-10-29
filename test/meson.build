@@ -238,3 +238,6 @@ test('AMF parser', amftest, suite: 'AMF parser', protocol:'tap')
 #abst_test = executable('abst_test', 'abst_test.cpp', dependencies: libmist_dep)
 #test('MP4::ABST Test', abst_test)
 
+
+tsptsrollovertest = executable('tsptsrollovertest', 'ts_pts_rollover.cpp', header_tgts, dependencies: libmist_dep)
+test('33-bit PTS/DTS wrap with B-frames', tsptsrollovertest, suite: 'TS demuxer')
