@@ -46,9 +46,13 @@ namespace Mist{
     size_t rawIdx;
     uint64_t lastRawPacket;
     bool bootMSOffsetCalculated;
-    uint64_t idleTimeout; ///< Max ms without received bytes before the connection is considered dead (0 = disabled)
-    uint64_t lastRecvMs;  ///< Util::bootMS() of the last successful receive (or of connection establishment)
+    uint64_t idleTimeout; ///< Max ms without a usable packet before the connection is considered dead (0 = disabled)
+    uint64_t lastRecvMs;  ///< Util::bootMS() of the last packet mapped to a track (or of connection establishment)
+    uint64_t lastTrackMs; ///< Util::bootMS() of the last packet delivered while the stream had a valid track (or of connection establishment)
     void armIdleWatchdog();
+    bool idleWatchdogExpired();
+    bool noTracksWatchdogExpired();
+    void refreshTrackWatchdog();
   };
 }// namespace Mist
 

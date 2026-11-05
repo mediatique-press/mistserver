@@ -47,6 +47,7 @@ namespace Mist{
     bootMSOffsetCalculated = false;
     idleTimeout = 0;
     lastRecvMs = 0;
+    lastTrackMs = 0;
     assembler.setLive();
     capa["name"] = "TSSRT";
     capa["desc"] = "This input allows for processing MPEG2-TS-based SRT streams using libsrt " SRT_VERSION_STRING ".";
@@ -123,14 +124,17 @@ namespace Mist{
       option["arg"] = "integer";
       option["long"] = "idletimeout";
       option["short"] = "I";
-      option["help"] = "Close the SRT connection and exit when no bytes were received for this many ms (0 = never)";
+      option["help"] = "Close the SRT connection and exit when no packet was delivered to a track, or the stream had no live track, for this many ms (0 = never)";
       option["value"].append(10000);
       config->addOption("idletimeout", option);
       capa["optional"]["idletimeout"]["name"] = "Idle timeout (ms)";
       capa["optional"]["idletimeout"]["help"] =
-        "If no bytes arrive over the SRT connection for this many milliseconds, the connection is "
-        "closed and the input exits so it can be restarted cleanly. Protects against a remote that "
-        "keeps the SRT session alive but never sends media. 0 disables the check.";
+        "If no demuxed packet reaches a track for this many milliseconds, or the stream has had no "
+        "live track for this many milliseconds while data keeps arriving, the connection is closed "
+        "and the input exits so it can be restarted cleanly. Protects against a remote that keeps "
+        "the SRT session alive but never sends usable media, and against a pull that stays alive "
+        "while its stream has no tracks. The first track gets the same grace period from connect. "
+        "0 disables both checks.";
       capa["optional"]["idletimeout"]["option"] = "--idletimeout";
       capa["optional"]["idletimeout"]["type"] = "uint";
       capa["optional"]["idletimeout"]["default"] = 10000;
@@ -182,6 +186,7 @@ namespace Mist{
   void InputTSSRT::armIdleWatchdog(){
     idleTimeout = config->getInteger("idletimeout");
     lastRecvMs = Util::bootMS();
+    lastTrackMs = lastRecvMs; // The first track gets the same grace period as any later gap.
     if (!idleTimeout || !srtConn || !*srtConn){return;}
     // Wake up at least every second, or faster for short timeouts, so the check is timely.
     uint64_t pollMs = idleTimeout < 1000 ? idleTimeout : 1000;
@@ -246,69 +251,132 @@ namespace Mist{
         if (!*srtConn){Util::sleep(1000);}
         ++connectCnt;
       }while (!*srtConn && connectCnt < 10);
-      if (!*srtConn){WARN_MSG("Connecting to %s timed out", u.getUrl().c_str());}
+      if (!*srtConn){
+        // Returning true here would make Input::stream() spawn a MistInBuffer for a source we never
+        // reached. That buffer then sits in WAIT with no tracks for its full input timeout (30 s by
+        // default) while every output blocks on it, which is the zombie-buffer cycle of NMW-3124.
+        // Fail preRun instead: Input::boot() exits via exitAndLogReason() with code 1, which the
+        // angel treats as a clean exit (input.cpp, "exitCode == 0 || exitCode == 1"), so the angel
+        // releases /MstSemPull_<stream> and the controller re-pulls from OFF on its next tick.
+        WARN_MSG("Connecting to %s timed out", u.getUrl().c_str());
+        Util::logExitReason(ER_READ_START_FAILURE, "Could not connect to SRT source %s", u.getUrl().c_str());
+        return false;
+      }
       armIdleWatchdog();
     }
     return true;
   }
 
+  /// Checks the idle watchdog. Returns true (after logging the exit reason and closing the SRT
+  /// connection) when no usable packet was produced for more than idleTimeout ms.
+  bool InputTSSRT::idleWatchdogExpired(){
+    if (!idleTimeout || !srtConn || !*srtConn){return false;}
+    uint64_t now = Util::bootMS();
+    if (now <= lastRecvMs + idleTimeout){return false;}
+    WARN_MSG("No usable data received over SRT for %" PRIu64 " ms (limit %" PRIu64 " ms) - closing connection", now - lastRecvMs, idleTimeout);
+    Util::logExitReason(ER_CLEAN_INACTIVE, "SRT connection idle for %" PRIu64 " ms", now - lastRecvMs);
+    srtConn->close();
+    return true;
+  }
+
+  /// No-tracks watchdog (NMW-3129, defence in depth). Returns true (after logging the exit reason
+  /// and closing the SRT connection) when the stream has had no live track for more than
+  /// idleTimeout ms even though data may still be arriving. Shares idleTimeout with the idle
+  /// watchdog, so --idletimeout 0 disables this check as well.
+  bool InputTSSRT::noTracksWatchdogExpired(){
+    if (!idleTimeout || !srtConn || !*srtConn){return false;}
+    uint64_t now = Util::bootMS();
+    if (now <= lastTrackMs + idleTimeout){return false;}
+    WARN_MSG("Stream has had no live track for %" PRIu64 " ms (limit %" PRIu64 " ms) - closing SRT connection", now - lastTrackMs, idleTimeout);
+    Util::logExitReason(ER_CLEAN_INACTIVE, "SRT stream had no live track for %" PRIu64 " ms", now - lastTrackMs);
+    srtConn->close();
+    return true;
+  }
+
+  /// Refreshes the no-tracks watchdog once the stream metadata holds at least one valid track.
+  /// Called after a packet has been handed to a track index, so a packet that maps to a track that
+  /// is no longer valid in the shared metadata does not count.
+  void InputTSSRT::refreshTrackWatchdog(){
+    if (!idleTimeout || !M){return;}
+    uint64_t now = Util::bootMS();
+    // Walking the shared track list per packet is wasteful; 250 ms of lag is irrelevant next to
+    // an idleTimeout measured in seconds.
+    if (now < lastTrackMs + 250){return;}
+    if (M.getValidTracks().size()){lastTrackMs = now;}
+  }
+
   // Retrieve the next packet to be played from the srt connection.
   void InputTSSRT::getNext(size_t idx){
-    thisPacket.null();
-    bool hasPacket = tsStream.hasPacket();
-    while (!hasPacket && srtConn && *srtConn && config->is_active){
+    // Outer loop: repeats when a demuxed packet belongs to a track we cannot map (e.g. a PID with an
+    // unknown codec, or H264 without SPS/PPS so initializeMetadata never added it). This used to be
+    // a self-recursive getNext() call, which neither bounded the stack nor let the watchdog see
+    // that no usable packet was coming out of the session.
+    while (config->is_active){
+      thisPacket.null();
+      if (idleWatchdogExpired() || noTracksWatchdogExpired()){return;}
+      bool hasPacket = tsStream.hasPacket();
+      while (!hasPacket && srtConn && *srtConn && config->is_active){
 
-      size_t recvSize = srtConn->RecvNow();
-      if (recvSize){
-        lastRecvMs = Util::bootMS();
-        if (rawMode){
-          keepAlive();
-          rawBuffer.append(srtConn->recvbuf, recvSize);
-          if (rawBuffer.size() >= 1316 && (lastRawPacket == 0 || lastRawPacket != Util::bootMS())){
-            if (rawIdx == INVALID_TRACK_ID){
-              rawIdx = meta.addTrack();
-              meta.setType(rawIdx, "meta");
-              meta.setCodec(rawIdx, "rawts");
-              meta.setID(rawIdx, 1);
-              userSelect[rawIdx].reload(streamName, rawIdx, COMM_STATUS_ACTSOURCEDNT);
+        size_t recvSize = srtConn->RecvNow();
+        if (recvSize){
+          if (rawMode){
+            // Raw mode forwards bytes without demuxing, so received bytes are usable data.
+            lastRecvMs = Util::bootMS();
+            keepAlive();
+            rawBuffer.append(srtConn->recvbuf, recvSize);
+            if (rawBuffer.size() >= 1316 && (lastRawPacket == 0 || lastRawPacket != Util::bootMS())){
+              if (rawIdx == INVALID_TRACK_ID){
+                rawIdx = meta.addTrack();
+                meta.setType(rawIdx, "meta");
+                meta.setCodec(rawIdx, "rawts");
+                meta.setID(rawIdx, 1);
+                userSelect[rawIdx].reload(streamName, rawIdx, COMM_STATUS_ACTSOURCEDNT);
+              }
+              uint64_t packetTime = Util::bootMS();
+              thisPacket.genericFill(packetTime, 0, 1, rawBuffer, rawBuffer.size(), 0, 0);
+              lastRawPacket = packetTime;
+              rawBuffer.truncate(0);
+              refreshTrackWatchdog();
+              return;
             }
-            uint64_t packetTime = Util::bootMS();
-            thisPacket.genericFill(packetTime, 0, 1, rawBuffer, rawBuffer.size(), 0, 0);
-            lastRawPacket = packetTime;
-            rawBuffer.truncate(0);
-            return;
+            continue;
           }
-          continue;
+          if (assembler.assemble(tsStream, srtConn->recvbuf, recvSize, true)){hasPacket = tsStream.hasPacket();}
+        }else if (srtConn && *srtConn){
+          // A zero-byte read on a still-connected socket means the receive timed out (or an
+          // asynchronous read found nothing).
+          Util::sleep(10);
         }
-        if (assembler.assemble(tsStream, srtConn->recvbuf, recvSize, true)){hasPacket = tsStream.hasPacket();}
-      }else if (srtConn && *srtConn){
-        // A zero-byte read on a still-connected socket means the receive timed out (or an
-        // asynchronous read found nothing). Check the idle watchdog before retrying, so a remote
-        // that keeps the SRT session alive without ever sending media cannot wedge us forever.
-        if (idleTimeout && Util::bootMS() > lastRecvMs + idleTimeout){
-          WARN_MSG("No data received over SRT for %" PRIu64 " ms (limit %" PRIu64 " ms) - closing connection", Util::bootMS() - lastRecvMs, idleTimeout);
-          Util::logExitReason(ER_CLEAN_INACTIVE, "SRT connection idle for %" PRIu64 " ms", Util::bootMS() - lastRecvMs);
-          srtConn->close();
-          break;
-        }
-        Util::sleep(10);
+        // The watchdog is checked on every pass, not only on zero-byte reads: a remote that keeps
+        // sending bytes the demuxer never turns into a usable packet must not keep us alive either.
+        // lastRecvMs is only refreshed below, once a packet has been mapped to a track.
+        if (!hasPacket && (idleWatchdogExpired() || noTracksWatchdogExpired())){return;}
       }
-    }
-    if (hasPacket){tsStream.getEarliestPacket(thisPacket);}
+      if (hasPacket){tsStream.getEarliestPacket(thisPacket);}
 
-    if (!thisPacket){
-      if (srtConn && *srtConn){
-        INFO_MSG("Could not getNext TS packet!");
-        Util::logExitReason(ER_FORMAT_SPECIFIC, "internal TS parser error");
-      }else{
-        Util::logExitReason(ER_CLEAN_REMOTE_CLOSE, "SRT connection close");
+      if (!thisPacket){
+        if (srtConn && *srtConn){
+          INFO_MSG("Could not getNext TS packet!");
+          Util::logExitReason(ER_FORMAT_SPECIFIC, "internal TS parser error");
+        }else{
+          Util::logExitReason(ER_CLEAN_REMOTE_CLOSE, "SRT connection close");
+        }
+        return;
       }
+
+      tsStream.initializeMetadata(meta);
+      thisIdx = M.trackIDToIndex(thisPacket.getTrackId(), getpid());
+      if (thisIdx != INVALID_TRACK_ID){break;}
+      // Unmappable track: drop the packet and fetch the next one without refreshing the watchdog.
+    }
+    if (!thisPacket || thisIdx == INVALID_TRACK_ID){
+      thisPacket.null();
       return;
     }
-
-    tsStream.initializeMetadata(meta);
-    thisIdx = M.trackIDToIndex(thisPacket.getTrackId(), getpid());
-    if (thisIdx == INVALID_TRACK_ID){getNext(idx);}
+    // A packet that maps to a known track is the only thing that counts as "not idle".
+    lastRecvMs = Util::bootMS();
+    // The no-tracks watchdog additionally requires that track to still be valid in the metadata.
+    refreshTrackWatchdog();
 
     uint64_t pktTimeWithOffset = thisPacket.getTime() + timeStampOffset;
     if (lastTimeStamp || timeStampOffset){
@@ -329,7 +397,16 @@ namespace Mist{
     thisTime = pktTimeWithOffset;
   }
 
-  bool InputTSSRT::openStreamSource(){return true;}
+  /// Called by Input::stream() once the buffer is up and the shared metadata is mapped, right before
+  /// the first getNext(). Both watchdog clocks are re-armed here: they were seeded at connect time in
+  /// armIdleWatchdog(), but Util::startInput() can block for up to 60 s waiting for a previous buffer
+  /// to leave SHUTDOWN or for the new one to come online. Measuring the grace period from connect
+  /// would make the very first getNext() exit a perfectly healthy session on a slow box.
+  bool InputTSSRT::openStreamSource(){
+    lastRecvMs = Util::bootMS();
+    lastTrackMs = lastRecvMs;
+    return true;
+  }
 
   void InputTSSRT::streamMainLoop(){
     // If we do not have a srtConn here, we are the main thread and should start accepting pushes.
