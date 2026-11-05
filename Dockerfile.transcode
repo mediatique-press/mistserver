@@ -1,0 +1,198 @@
+# NedMedia transcode image: MistServer from THIS checkout, built against glibc on
+# Ubuntu 24.04, plus an ffmpeg that can reach NVENC/NVDEC. One image for the GPU
+# transcode boxes, the audio transcode boxes and the dev transcode pods.
+#
+# This file is a sibling of upstream's Dockerfile.mistserver (which stays
+# byte-identical to upstream so the fork rebases cleanly). The two differ in:
+#
+#   * libc. Upstream's runtime is Alpine/musl. ffmpeg reaches NVENC by
+#     dlopen()ing the driver's libnvidia-encode.so.1 / libcuda.so.1 at runtime,
+#     and those are glibc builds, so ffmpeg must be a dynamic glibc binary and
+#     MistServer must live on the same libc in the same image.
+#   * RIST and SCTP (WebRTC data channels) are compiled out: nothing on the
+#     transcode path uses them and it drops two dependencies.
+#   * ffmpeg n7.1 with --enable-nvenc/--enable-nvdec/--enable-cuda-llvm,
+#     libx264, drawtext (freetype/fontconfig/harfbuzz), plus one font.
+#   * NOSESS=1 and the NVIDIA container-toolkit variables are set on the image.
+#   * No config.json is baked in: the unit or manifest bind-mounts its own and
+#     passes `-c <file> -C r`. MistController starts with defaults if the file
+#     is missing, but then has no account and no streams (api2 answers NOACC).
+#
+# Layout: Mist binaries in /usr/local/bin, exactly like upstream's image, with a
+# /MistController symlink for units that still name that path. MistServer finds
+# its siblings via readlink(/proc/self/exe), which resolves the symlink, so the
+# symlink is cosmetic. ffmpeg goes to /usr/local/bin as well; MistProcMKVExec
+# spawns bare `ffmpeg` from PATH.
+#
+# Ported from live-stream-v2/container/transcode/gpu/Dockerfile (stages 1 and 2
+# and their build assertions), which this file replaces.
+#
+# Build (from the repo root, at the release tag):
+#   docker build -f Dockerfile.transcode \
+#     --build-arg BUILDKIT_SYNTAX=docker/dockerfile:1 \
+#     --build-arg VERSION=nedmedia-vN --build-arg REVISION=$(git rev-parse HEAD) \
+#     -t nedmedia/mistserver:nedmedia-vN-transcode .
+#
+# NVENC itself cannot be tested where this is built; only the presence of the
+# encoder, filter and hwaccel is asserted. The first real check is a rung on a
+# GPU box.
+
+ARG UBUNTU=ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
+
+# ---------------------------------------------------------------------------
+# Stage 1: ffmpeg with NVENC, from source, pinned to a tag.
+#
+# From source rather than a distro package: Ubuntu's ffmpeg tracks Ubuntu's
+# cadence and its enabled features are not ours to pin.
+# ---------------------------------------------------------------------------
+FROM ${UBUNTU} AS ff
+
+ARG FFMPEG_VERSION=7.1
+ARG NV_CODEC_HEADERS_VERSION=n12.2.72.0
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      build-essential ca-certificates curl git pkg-config nasm yasm \
+      libx264-dev libfreetype6-dev libfontconfig1-dev libharfbuzz-dev \
+      clang \
+    && rm -rf /var/lib/apt/lists/*
+# `clang` is for --enable-cuda-llvm: ffmpeg's CUDA filters (scale_cuda among
+# them) are .cu kernels compiled to PTX at BUILD time, and configure only builds
+# them when it finds nvcc (the CUDA toolkit, gigabytes) or a clang that can
+# target NVPTX. Ubuntu's clang can, with no toolkit and no CUDA headers. The PTX
+# is embedded in the binary; at runtime it needs only the driver's libcuda,
+# which the NVIDIA container toolkit injects for NVENC anyway.
+
+# NVENC/NVDEC headers. HEADERS ONLY: no driver, no toolkit, nothing that ends
+# up in the final image. The libraries arrive at runtime from the host driver.
+RUN git clone --branch ${NV_CODEC_HEADERS_VERSION} --depth 1 \
+      https://github.com/FFmpeg/nv-codec-headers.git /tmp/nvh \
+    && make -C /tmp/nvh install \
+    && rm -rf /tmp/nvh
+
+RUN git clone --branch n${FFMPEG_VERSION} --depth 1 \
+      https://github.com/FFmpeg/FFmpeg.git /tmp/ffmpeg \
+    && cd /tmp/ffmpeg \
+    && ./configure \
+         --prefix=/opt/ffmpeg \
+         --enable-gpl \
+         --enable-nvenc \
+         --enable-nvdec \
+         --enable-cuda-llvm \
+         --enable-libx264 \
+         --enable-libfreetype \
+         --enable-libfontconfig \
+         --enable-libharfbuzz \
+         --disable-doc \
+         --disable-ffplay \
+         --disable-debug \
+    && make -j"$(nproc)" \
+    && make install \
+    && rm -rf /tmp/ffmpeg
+
+# configure does NOT fail when NVENC is missing; it silently disables it, and
+# the first sign would be a rung that never appears on a GPU box. Fail the
+# BUILD instead, for each of the three things the ladder depends on.
+RUN /opt/ffmpeg/bin/ffmpeg -hide_banner -encoders 2>/dev/null | grep -q h264_nvenc \
+    || (echo "FATAL: this ffmpeg has no h264_nvenc; the build is pointless" && exit 1)
+RUN /opt/ffmpeg/bin/ffmpeg -hide_banner -filters 2>/dev/null | grep -q ' scale_cuda ' \
+    || (echo "FATAL: this ffmpeg has no scale_cuda; --enable-cuda-llvm did not take (is clang installed?)" && exit 1)
+RUN /opt/ffmpeg/bin/ffmpeg -hide_banner -hwaccels 2>/dev/null | grep -q '^cuda$' \
+    || (echo "FATAL: this ffmpeg has no cuda hwaccel; NVDEC decode is unavailable" && exit 1)
+RUN /opt/ffmpeg/bin/ffmpeg -hide_banner -encoders 2>/dev/null | grep -q ' aac ' \
+    || (echo "FATAL: this ffmpeg has no aac encoder" && exit 1)
+RUN /opt/ffmpeg/bin/ffmpeg -hide_banner -filters 2>/dev/null | grep -q ' drawtext ' \
+    || (echo "FATAL: this ffmpeg has no drawtext filter; the overlay rungs would fail at spawn" && exit 1)
+
+# ---------------------------------------------------------------------------
+# Stage 2: MistServer from THIS checkout, against Ubuntu's glibc.
+#
+# Same Meson build as upstream's Dockerfile.mistserver, with mbedtls, libsrt
+# and libsrtp2 coming from the repo's own wraps (subprojects/), minus RIST and
+# SCTP. Source is the build context, not a git clone, so the image is exactly
+# the commit it was built from.
+# ---------------------------------------------------------------------------
+FROM ${UBUNTU} AS mist
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      build-essential ca-certificates git meson ninja-build pkg-config python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+ADD . /src/
+ARG MIST_OPTS
+ARG DEBUG=3
+ARG VERSION=Unknown
+ARG RELEASE=Docker_transcode
+# --libdir=lib: Meson's Debian default is lib/x86_64-linux-gnu; keep upstream's
+# flat /usr/local/lib so one layout serves every variant.
+RUN mkdir /build && cd /build \
+    && meson setup /src --prefix=/usr/local --libdir=lib \
+         -DDOCKERRUN=true -DNOUPDATE=true -DNORIST=true -DNOUSRSCTP=true \
+         -DDEBUG=${DEBUG} -DVERSION=${VERSION} -DRELEASE=${RELEASE} -Dstrip=true ${MIST_OPTS} \
+    && DESTDIR=/stage ninja install
+
+# NOSESS is read with getenv() in the output, input and process binaries; a
+# build that lacks the string ignores the variable and brings back the lost
+# /MstSession race (NMW-1826). Fail the BUILD.
+RUN for b in MistOutHLS MistInBuffer MistInTSSRT MistProcMKVExec; do \
+      grep -a -q NOSESS /stage/usr/local/bin/$b \
+      || (echo "FATAL: $b has no NOSESS handling" && exit 1); \
+    done
+# SRT is conditional on its library resolving and Meson only warns when it does
+# not; the transcode boxes pull SRT, so a build without the input is useless.
+RUN test -x /stage/usr/local/bin/MistInTSSRT && test -x /stage/usr/local/bin/MistController \
+    || (echo "FATAL: MistInTSSRT or MistController missing from the build" && exit 1)
+
+# ---------------------------------------------------------------------------
+# Stage 3: the image that runs.
+# ---------------------------------------------------------------------------
+FROM ${UBUNTU}
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      libx264-164 libfreetype6 libfontconfig1 libharfbuzz0b ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=mist /stage/usr/local/ /usr/local/
+RUN ldconfig
+
+COPY --from=ff /opt/ffmpeg/bin/ffmpeg /usr/local/bin/ffmpeg
+COPY --from=ff /opt/ffmpeg/bin/ffprobe /usr/local/bin/ffprobe
+
+# One font for the burn-in overlay (Liberation Sans, SIL OFL). drawtext is
+# compiled in but neither base ships a typeface; without this every overlay
+# encode dies at filter-graph setup, surfacing as a rung that never appears.
+# Use an absolute fontfile= in the exec line, never a fontconfig lookup name.
+COPY docker/transcode/LiberationSans-Regular.ttf /usr/share/fonts/airstream.ttf
+
+# Compatibility with units that still name /MistController. Sibling lookup goes
+# through /proc/self/exe and resolves to /usr/local/bin.
+RUN ln -s /usr/local/bin/MistController /MistController
+
+# The NVIDIA container toolkit injects driver libraries according to this
+# variable, and its DEFAULT is `compute,utility`, which does NOT include
+# libnvidia-encode.so.1. Without `video`, nvidia-smi works, the GPU is visible,
+# and every encode fails with "Cannot load libnvidia-encode.so.1". Set on the
+# image so a box cannot get it wrong by omission. Harmless where there is no
+# toolkit (audio boxes, dev pods).
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+
+# No session system: outputs and inputs never spawn MistSession nor open its
+# shared-memory page, the one-shot open that loses a race on a loaded box and
+# ends a viewer's session (NMW-1826). Costs per-session statistics and the
+# USER_NEW/USER_END triggers, which nothing here reads. It is also what makes
+# a permissive `trustedproxy` safe (NMW-3151).
+ENV NOSESS=1
+
+ARG VERSION=Unknown
+ARG REVISION=unknown
+LABEL org.opencontainers.image.title="nedmedia/mistserver transcode" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.source="https://github.com/mediatique-press/mistserver"
+
+EXPOSE 4242 8080
+# 1935 is not exposed: these boxes pull. An RTMP listener here would be an
+# unauthenticated publish surface backed by a hardware encoder.
+
+ENTRYPOINT ["MistController"]
+HEALTHCHECK CMD ["MistUtilHealth"]
