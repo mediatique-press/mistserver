@@ -1,0 +1,7 @@
+# nedmedia/mistserver:nedmedia-v2 plus ffmpeg + curl. The Mist binaries are untouched;
+# ffmpeg is only here so the transcode container can run a MistProcMKVExec rung the
+# way production does and so the "source" container can push a synthetic RTMP stream.
+# Local image only -- never pushed.
+ARG BASE=nedmedia/mistserver:nedmedia-v2
+FROM ${BASE}
+RUN apk add --no-cache ffmpeg curl

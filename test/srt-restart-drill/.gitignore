@@ -1,0 +1,3 @@
+run/
+# The root .gitignore drops every *.json; the harness configs must be tracked.
+!config/*.json
