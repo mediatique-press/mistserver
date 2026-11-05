@@ -1,0 +1,52 @@
+{
+  "account": {"drill": {"password": "098f6bcd4621d373cade4e832627b4f6"}},
+  "bandwidth": {"exceptions": ["::1", "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]},
+  "config": {
+    "accesslog": "LOG",
+    "controller": {"interface": null, "port": null, "username": null},
+    "debug": 4,
+    "defaultStream": null,
+    "prometheus": "metrics",
+    "protocols": [
+      {"connector": "HTTP"},
+      {"connector": "HLS"},
+      {"connector": "CMAF"}
+    ],
+    "serverid": "drill-transcode",
+    "sessionInputMode": 15, "sessionOutputMode": 15, "sessionStreamInfoMode": 1,
+    "sessionUnspecifiedMode": 0, "sessionViewerMode": 14, "tknMode": 3,
+    "triggers": null, "trustedproxy": []
+  },
+  "push_settings": {"maxspeed": 0, "wait": 3},
+  "streams": {
+    "drill": {
+      "name": "drill",
+      "debug": 4,
+      "source": "srt://ingest:8889?streamid=live+drill",
+      "DVR": 60000,
+      "segmentsize": 6000,
+      "resume": 0,
+      "stop_sessions": false,
+      "tags": [],
+      "processes": [
+        {
+          "process": "MKVExec",
+          "codec": "H264",
+          "exec": "ffmpeg -loglevel warning -hide_banner -fflags nobuffer -i - -vf scale=426:240 -c:v libx264 -preset veryfast -tune zerolatency -profile:v main -pix_fmt yuv420p -b:v 300k -maxrate 330k -bufsize 600k -force_key_frames source -bf 0 -threads 2 -c:a aac -b:a 64k -ac 2 -ar 48000 -f matroska -cluster_time_limit 0 -",
+          "resolution": "426x240",
+          "restart_type": "fixed",
+          "exit_unmask": false,
+          "inconsequential": false,
+          "sources": [],
+          "track_select": "audio=all&video=all",
+          "source_mask": 4,
+          "target_mask": 1,
+          "tags_inhibit": [],
+          "target_profiles": [{"name": "240p", "width": 426, "height": 240, "bitrate": 300, "x-LSP-name": "240p"}],
+          "x-LSP-kind": "video",
+          "x-LSP-name": "240p"
+        }
+      ]
+    }
+  }
+}

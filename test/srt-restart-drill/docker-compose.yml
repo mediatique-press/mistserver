@@ -1,0 +1,74 @@
+# NMW-3126 -- local reproduction of the production ingest -> transcode SRT pull topology.
+#
+#   source    ffmpeg, synthetic H.264+AAC, RTMP push to ingest (restart: always, like an encoder)
+#   ingest    stream "live+drill" (source push://), TSSRT listener output on 8889
+#   transcode stream "drill" (source srt://ingest:8889?streamid=live+drill), one MKVExec rung
+#
+# Config files are copied by drill.sh from ./config into ./run/<svc>/ because Mist rewrites
+# its config on disk (-C rw default); the repo copies stay pristine.
+name: srt-restart-drill
+services:
+  ingest:
+    image: ${INGEST_IMAGE:-nedmedia/mistserver:nedmedia-v2}
+    container_name: drill-ingest
+    command: ["-c", "/config/config.json", "-g", "4"]
+    volumes:
+      - ./run/ingest:/config
+    shm_size: 512m
+    ports:
+      - "127.0.0.1:18080:8080"
+      - "127.0.0.1:14242:4242"
+  transcode:
+    image: ${TRANSCODE_IMAGE:-nedmedia/mistserver:nedmedia-v2-drill}
+    container_name: drill-transcode
+    command: ["-c", "/config/config.json", "-g", "4"]
+    volumes:
+      - ./run/transcode:/config
+    shm_size: 512m
+    ports:
+      - "127.0.0.1:28080:8080"
+      - "127.0.0.1:24242:4242"
+    depends_on:
+      - ingest
+  source:
+    image: ${TRANSCODE_IMAGE:-nedmedia/mistserver:nedmedia-v2-drill}
+    container_name: drill-source
+    entrypoint: ["ffmpeg"]
+    command:
+      - -loglevel
+      - warning
+      - -re
+      - -f
+      - lavfi
+      - -i
+      - testsrc2=size=640x360:rate=25
+      - -f
+      - lavfi
+      - -i
+      - sine=frequency=440:sample_rate=48000
+      - -c:v
+      - libx264
+      - -preset
+      - veryfast
+      - -tune
+      - zerolatency
+      - -profile:v
+      - main
+      - -pix_fmt
+      - yuv420p
+      - -g
+      - "50"
+      - -b:v
+      - 600k
+      - -c:a
+      - aac
+      - -b:a
+      - 96k
+      - -ar
+      - "48000"
+      - -f
+      - flv
+      - rtmp://ingest/push/live+drill
+    restart: always
+    depends_on:
+      - ingest
