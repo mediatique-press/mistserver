@@ -2600,7 +2600,11 @@ context_menu: function(){
             if (Number(curval) != 0) $field.setval(curval);
           });
           for (let j in e.unit) {
-            $unit.append($("<option>").val(e.unit[j][0]).text(e.unit[j][1]));
+            var $option = $("<option>").val(e.unit[j][0]).text(e.unit[j][1]);
+            if ('default' in e && e.unit[j][0] == e.default) {
+              $option.attr('selected', 'selected');
+            }
+            $unit.append($option);
           }
           $fc.append(
             $('<span>').addClass('unit').html($unit)
@@ -2612,23 +2616,28 @@ context_menu: function(){
             if (kind == "initial") {
               var val = $(this).getval();
               var opts = $(this).data("opts");
-              if ((opts.placeholder) && (Number(val) == 0)) {
-                val = opts.placeholder;
+              if (("default_unit" in opts) && (Number(val) == 0)) {
+                $(this).closest(".field_container").find(".unit select").val(opts.default_unit).trigger("change");
               }
-              if (Number(val) != 0) {
-                //set unit to "shortest" value
-                var shortest = 1e9;
-                var unit = false;
-                for (var i in opts.unit) {
-                  //calculate display value for this unit
-                  var display = (val / opts.unit[i][0]).toString();
-                  if (display.length < shortest) {
-                    shortest = display.length;
-                    unit = opts.unit[i][0];
-                  }
+              else {
+                if ((opts.placeholder) && (Number(val) == 0)) {
+                  val = opts.placeholder;
                 }
-                if (unit) {
-                  $(this).closest(".field_container").find(".unit select").val(unit).trigger("change");
+                if (Number(val) != 0) {
+                  //set unit to "shortest" value
+                  var shortest = 1e9;
+                  var unit = false;
+                  for (var i in opts.unit) {
+                    //calculate display value for this unit
+                    var display = (val / opts.unit[i][0]).toString();
+                    if (display.length < shortest) {
+                      shortest = display.length;
+                      unit = opts.unit[i][0];
+                    }
+                  }
+                  if (unit) {
+                    $(this).closest(".field_container").find(".unit select").val(unit).trigger("change");
+                  }
                 }
               }
             }
@@ -4360,8 +4369,8 @@ context_menu: function(){
             help: 'Please provide your account details.<br>You were asked to set these when MistController was started for the first time. If you did not yet set any account details, log in with your desired credentials to create a new account.'
           },{
             label: 'Host',
-            help: 'Url location of the MistServer API. Generally located at http://MistServerIP:4242/api',
-            'default': 'http://localhost:4242/api',
+            help: 'Url location of the MistServer API. Generally located at http://MistServerIP:4242',
+            'default': 'http://localhost:4242',
             pointer: {
               main: mist.user,
               index: 'host'
@@ -5081,7 +5090,11 @@ context_menu: function(){
           defaultStream: mist.data.config.defaultStream,
           trustedproxy: mist.data.config.trustedproxy,
           weights: mist.data.config.weights
-        };
+        };           
+        var s_cache = mist.data.config.cache || {};
+        s_cache.bytes = s_cache.bytes || null;      //if set to 0, show placeholder
+        s_cache.percent = s_cache.percent || null;  //if set to 0, show placeholder
+
         var s_sessions = {
           sessionViewerMode: mist.data.config.sessionViewerMode,
           sessionInputMode: mist.data.config.sessionInputMode,
@@ -5442,7 +5455,68 @@ context_menu: function(){
           }
         ]));
 
+        $main.append(UI.buildUI([
+          $("<h3>").text("Cache settings"),{
+            type: "help",
+            help: "These settings control the local cache. If both limits are set, the cache stops growing at whichever threshold is reached first. When full, older and less frequently used files are replaced automatically."
+          },{
+            type: "browse",
+            filetypes: ["/*/"],
+            label: "Cache folder",
+            placeholder: "Disable cache",
+            pointer: {
+              main: s_cache,
+              index: "path"
+            },
+            help: "Select the directory where cached data will be stored. If you leave this blank, caching will be disabled."
+          },{
+            type: "int",
+            label: "Cache size limit in bytes",
+            min: 0,
+            unit: [
+              [1, "byte"],
+              [1024, "Kibyte"],
+              [1048576, "Mibyte"],
+              [1073741824,"Gibyte"],
+              [1099511627776,"Tibyte"]
+            ],
+            placeholder: "Unlimited",
+            default_unit: 1073741824, //GiB
+            pointer: {
+              main: s_cache,
+              index: "bytes"
+            },
+            help: "Maximum amount of disk space the cache may use, in bytes.<br>To use unlimited space, leave this value blank or set it to 0. If you want to disable the cache, unset the cache folder.",
+          },{
+            type: "double",
+            label: "Cache size limit as percentage of disk size",
+            min: 0,
+            max: 100,
+            step: 0.001,
+            unit: "%",
+            placeholder: "100", 
+            pointer: {
+              main: s_cache,
+              index: "percent"
+            },
+            help: "Maximum amount of disk space the cache may use, as a percentage of the disk it's on.<br>When set to 0, the cache size will be unlimited: effectively 100%. If you want to disable the cache, unset the cache folder.",
+          },,{
+            type: "buttons",
+            buttons: [{
+              type: "save",
+              label: "Save",
+              'function': function(ele){
+                $(ele).text("Saving..");
 
+                var save = {config: {cache: s_cache}};
+
+                mist.send(function(){
+                  UI.navto('General');
+                }, save);
+              }
+            }]
+          }
+        ]));
 
         $main.append(UI.buildUI([
           $("<h3>").text("Sessions"),
@@ -7546,8 +7620,9 @@ context_menu: function(){
             ["Preview stream",function(){ UI.navto("Preview",streamname); },"Preview","Watch the stream."],
             ["Embed stream",function(){ UI.navto("Embed",streamname); },"Embed","Get urls to this stream or get code to embed it on your website."]
           ];
+          let cache_enabled = mist.data.config.cache && mist.data.config.cache.path;
           var actions = [
-            ["Delete stream",function(){
+            ["Delete stream"+(cache_enabled ? ", keep cache" : ""),function(){
               if (confirm('Are you sure you want to delete the stream "'+streamname+'"?')) {
                 delete mist.data.streams[streamname];
                 mist.send(function(d){
@@ -7555,7 +7630,23 @@ context_menu: function(){
                   $streams.update(current_streams);
                 },{deletestream: [streamname]});
               }
-            },"trash","Remove this stream's settings."],
+            },"trash","Remove this stream's settings"+(cache_enabled ? ", but do not clear the cache." : "")],
+            cache_enabled ? ["Delete stream, remove cache",function(){
+              if (confirm('Are you sure you want to delete the stream "'+streamname+'" and its cache?')) {
+                delete mist.data.streams[streamname];
+                mist.send(function(d){
+                  delete current_streams[streamname];
+                  $streams.update(current_streams);
+                },{deletestream: [streamname], deletecache: [streamname]});
+              }
+            },"trashsweep","Remove this stream's settings and delete its cache."] : false,
+            cache_enabled ? ["Remove stream cache",function(){
+              if (confirm('Are you sure you want to clear the cache for stream "'+streamname+'"?')) {
+                mist.send(function(d){
+                  //done
+                },{deletecache: [streamname]});
+              }
+            },"sweep","Remove this stream's cache."] : false,
             ["Stop sessions",function(){
               if (confirm("Are you sure you want to disconnect all sessions (viewers, pushes and possibly the input) for the stream '"+streamname+"'?")) {
                 mist.send(function(){
@@ -7582,8 +7673,13 @@ context_menu: function(){
             gototabs.shift();
             gototabs.unshift([$("<span>").html("Create <b>"+streamname.split("+")[0]+"</b>"),function(){ UI.navto("Edit",streamname); },"Edit","Create this stream."]);
             actions.shift();
+            actions.shift();
           }
-          if (settings.isfolderstream) {
+          else if (settings.ischild) {
+            actions.shift();
+            actions.shift();
+          }
+          else if (settings.isfolderstream) {
             gototabs.pop();
             gototabs.pop();
             actions = [actions[0]];
@@ -12308,6 +12404,15 @@ context_menu: function(){
       },
       actions: function(currenttab,streamname){
         return $("<section>").addClass("actions").addClass("bigbuttons").html(
+            mist.data.config.cache && mist.data.config.cache.path ? 
+          $("<button>").text("Remove stream cache").attr("data-icon","sweep").attr("title","Remove this stream's cache.").click(function(){
+            if (confirm("Are you sure you want to clear the cache for this stream?")) { 
+              mist.send(function(){
+                //done
+              },{deletecache:streamname});
+            }
+          }) : "",
+        ).append(
           $("<button>").text("Stop all sessions").attr("data-icon","stop").attr("title","Disconnect sessions for this stream. Disconnecting a session will kill any currently open connections (viewers, pushes and possibly the input). If the USER_NEW trigger is in use, it will be triggered again by any reconnecting connections.").click(function(){
             if (confirm("Are you sure you want to disconnect all sessions (viewers, pushes and possibly the input) from this stream?")) { 
               mist.send(function(){
@@ -14332,11 +14437,15 @@ context_menu: function(){
           Connected: function(d){
             return [d.conntime,UI.format.duration(d.conntime)];
           },
-          "Data downloaded": function(d){
-            return [d.down,UI.format.bytes(d.down)];
+          "Data transmitted": function(d){
+            return [d.down + d.up,$("<div>").addClass("data_transmitted").append(
+              UI.format.bytes(d.up).attr("data-value",d.up).attr("title","Uploaded").attr("data-prefix","↑")
+            ).append(
+              UI.format.bytes(d.down).attr("data-value",d.down).attr("title","Downloaded").attr("data-prefix","↓")
+            )];
           },
           "Current bitrate": function(d){
-            return [d.downbps,UI.format.bits(d.downbps*8,true)];
+            return [d.downbps + d.upbps,UI.format.bits((d.downbps+d.upbps)*8,true)];
           },
           "Media time": function(d){
             return [d.position,d.position ? UI.format.duration(d.position) : ""];
@@ -14349,6 +14458,15 @@ context_menu: function(){
           },
           "Packets retransmitted": function(d){
             return [d.pktretransmit,d.pktcount ? UI.format.number(d.pktretransmit,{round:false}) : ""]
+          },
+          "Packets recovered": function(d){
+            return [d.pktrecover,d.pktcount ? UI.format.number(d.pktrecover,{round:false}) : ""]
+          },
+          "Round trip time": function(d){
+            return [d.rtt,d.pktcount ? UI.format.addUnit(UI.format.number(d.rtt),"ms") : ""]
+          },
+          "Latency": function(d){
+            return [d.latency,d.pktcount ? UI.format.addUnit(UI.format.number(d.latency),"ms") : ""]
           }
         };
         const context_menu = new UI.context_menu();
@@ -14617,112 +14735,217 @@ context_menu: function(){
       var busy = false;
       var queue = [];
 
+
+      let decayingLoad = 0;
+      let lastTime = performance.now();
+      const halflife = 300; //ms for load to drop by half
+      const batchThreshold = 100; //when load exceeds threshold, start batching message inserts
+      const cleanseThreshold = 200; //when load exceeds threshold, start collapsing messages
+      function recordLoad(started) {
+        const now = performance.now();
+        const duration = now - started;
+        const timePassed = now - lastTime;
+        lastTime = now;
+
+        //decay previous load based on elapsed time
+        decayingLoad *= Math.pow(0.5, timePassed / halflife);
+
+        //add the new duration
+        decayingLoad += duration;
+
+        //console.log("exec time",duration,"ms","decayingLoad",decayingLoad,"queue",queue.length);
+      }
+
+
       function addMessages(){
+        //does its best to add as many log messages as possible without murdering the UI
+        
         busy = true;
 
-        requestAnimationFrame(function(){
-          while (queue.length) {
-            $logs.append(queue.shift());
+        function processBatch(){
+          const started = performance.now();
+          
+          //check if we should wait for more messages first
+          if ((decayingLoad > batchThreshold) && (started - lastTime < decayingLoad)) {
+            //console.log("batching..");
+            requestAnimationFrame(processBatch);
+            return;
           }
 
-          if ($logs.children().length > 1000) {
-            $logs.children().first().remove();
+          //console.log("queue length",queue.length);
+
+          if (decayingLoad > cleanseThreshold) {
+            let i = 0;
+            let cleansed = 0;
+            while (i < queue.length) {
+              if (Array.isArray(queue[i])) { //only collapse normal log messages, keep errors
+                cleansed++;
+                queue.shift();
+              }
+              else {
+                i++;
+              }
+            }
+            if (cleansed > 0) { //if cleansed == 1 I would be sad :(
+              const d = document.createElement("div");
+              d.appendChild(document.createTextNode(cleansed+" messages were skipped to prevent freezing your browser."));
+              queue.push(d);
+            }
+            //console.log("collapsed",cleansed,"queue length",queue.length)
           }
+
+          let scrollTab = false
+          if (tab && !tab.closed) scrollTab = (tab.document.scrollingElement.scrollTop >= tab.document.scrollingElement.scrollHeight - tab.document.scrollingElement.clientHeight);
+          let processed = 0; //add at most N log messages per batch
+          while (queue.length && (processed < 250)) {
+            const row = createRow(queue.shift());
+
+            $logs[0].appendChild(row);
+            if (tab && !tab.closed) {
+              tab.document.body.appendChild(row.cloneNode(true));
+            }
+            processed++;
+          }
+          while ($logs[0].children.length > 1000) {
+            $logs[0].removeChild($logs[0].children[0]);
+          }
+          //browsers should automatically pause repaints until JavaScript execution completes
 
           if (scroll) $logs[0].scrollTop = $logs[0].scrollHeight; 
-
-          if (tab) {
-            try {
-              let s = (tab.document.scrollingElement.scrollTop >= tab.document.scrollingElement.scrollHeight - tab.document.scrollingElement.clientHeight);
-              tab.document.write($msg[0].outerHTML);
-              if (s) tab.document.scrollingElement.scrollTop = tab.document.scrollingElement.scrollHeight;
+          if (tab && !tab.closed) {
+            if (scrollTab) {
+              tab.document.scrollingElement.scrollTop = tab.document.scrollingElement.scrollHeight;
             }
-            catch (e) {}
+            if (tab.document.body.children.length > 2500) {
+              //stop adding lines to the current tab, don't open a new one unless the user clicks the button again
+              tab.document.body.innerHTML += ("<div>This raw log window is now considered full - please open a new raw tab to continue capturing new raw log messages.</div>");
+              tab.document.title += " (until "+UI.format.time(new Date().getTime()*1e-3)+")";
+              if (scrollTab) {
+                tab.document.scrollingElement.scrollTop = tab.document.scrollingElement.scrollHeight;
+              }
+              tab = null;
+            }
           }
           busy = false;
 
-        });
+          //console.log("Processed",processed,"Queue",queue.length);
+
+          recordLoad(started);
+        }
+
+        requestAnimationFrame(processBatch);
       }
 
       UI.sockets.ws.active_streams.subscribe(function(type,data){
-        var $msg;
         if (type == "log") {
           if (streamname && (data[3] != "") && (data[3] != streamname.split("+")[0])) { //filter out messages about other streams
             return;
           }
           if (data[1] == "ACCS") { return; } //the access log has its own container
 
-          $msg = $("<div>").addClass("message").attr("data-debuglevel",data[1]).html(
-            $("<span>").addClass("time").html(
-              $("<span>").append(
-                $("<span>").addClass("description").text("[")
-              ).append(
-                $("<span>").text(UI.format.dateTime(data[0]))
-              ).append(
-                $("<span>").addClass("description").text("] ")
-              ).children()
-            )
-          ).append(
-            $("<span>").addClass("binary").attr("title","binary name").text(data[5])
-          ).append(
-            $("<span>").addClass("stream").attr("title","stream name").html(
-              data[3] ? $("<span>").append(
-                $("<span>").addClass("description").text(":")
-              ).append(
-                $("<span>").text(data[3])
-              ).children() : ""
-            )
-          ).append(
-            $("<span>").addClass("pid").attr("title","pid").html(
-              data[4] ? $("<span>").append(
-                $("<span>").addClass("description").text(" (")
-              ).append(
-                $("<span>").text(data[4])
-              ).append(
-                $("<span>").addClass("description").text(")")
-              ).children() : ""
-            )
-          ).append(
-            $("<span>").addClass("debuglevel").attr("title","debug level").html(
-              $("<span>").append(
-                $("<span>").addClass("description").text(" [")
-              ).append(
-                $("<span>").text(data[1])
-              ).append(
-                $("<span>").addClass("description").text("]")
-              ).children() 
-            )
-          ).append(
-            $("<span>").addClass("message").text(" "+data[2])
-          ).append(
-            $("<span>").addClass("line").addClass("copy_but_hide").attr("title","line number").html(data[6] ? "&nbsp;("+data[6]+")" : "")
-          );
-
-          queue.push($msg);
+          queue.push(data);
           if (!busy) addMessages();
 
         }
         else if (type == "error") {
-          $msg = $("<div>").text(data);
-        }
-
-        if ($msg) {
-          queue.push($msg);
+          queue.push($("<div>").text(data)[0]);
           if (!busy) addMessages();
         }
-
       });
+
+      function createRow(data){
+
+        function createSpan(text,classes) {
+          let s = document.createElement("span");
+          if (classes) {
+            if (typeof classes == "string") classes = [classes];
+            while (classes.length) {
+              s.classList.add(classes.shift());
+            }
+          }
+          if (text) {
+            s.appendChild(document.createTextNode(text));
+          }
+          return s;
+        }
+
+        if (Array.isArray(data)) {
+          let row = document.createElement("div");
+          row.classList.add("message");
+          row.setAttribute("data-debuglevel",data[1]);
+
+          let time = document.createElement("span");
+          time.classList.add("time");
+          row.appendChild(time);
+          time.appendChild(createSpan("[","description"));
+          time.appendChild(createSpan(UI.format.dateTime(data[0])));
+          time.appendChild(createSpan("] ","description"));
+          
+          let bin = createSpan(data[5],"binary");
+          bin.setAttribute("title","binary name");
+          row.appendChild(bin);
+
+          let stream = createSpan(false,"stream");
+          stream.setAttribute("title","stream name");
+          if (data[3]) {
+            stream.appendChild(createSpan(":","description"));
+            stream.appendChild(createSpan(data[3]));
+          }
+          row.appendChild(stream);
+
+          let pid = createSpan(false,"pid");
+          pid.setAttribute("title","pid");
+          if (data[4]) {
+            pid.appendChild(createSpan(" (","description"));
+            pid.appendChild(createSpan(data[4]));
+            pid.appendChild(createSpan(")","description"));
+          }
+          row.appendChild(pid);
+
+          let level = createSpan(false,"debuglevel");
+          level.setAttribute("title","debug level");
+          level.appendChild(createSpan(" [","description"));
+          level.appendChild(createSpan(data[1]));
+          level.appendChild(createSpan("]","description"));
+          row.appendChild(level);
+
+          row.appendChild(createSpan(" "+data[2],"message"));
+
+          let line = createSpan(data[6] ? "\u00A0("+data[6]+")" : "","copy_but_hide");
+          line.setAttribute("title","line number");
+          row.appendChild(line);
+
+          return row;
+        }
+        return data;
+      }
+
+      let tabnum = 1;
+      function newRawTab() {
+        let title = "MistServer logs "+(streamname ? " for '"+streamname+"'" : "");
+        tab = window.open("",title+" #"+tabnum);
+        tabnum++;
+        if (tab) {
+          const icon = document.head.querySelector("link[rel~=icon]");
+          const newicon = "<link rel=\"icon\" type=\""+(icon.getAttribute("type") || "image/png")+"\" href=\""+icon.getAttribute("href")+"\">";
+          
+          tab.document.write("<html><head><title>"+title+"</title><meta http-equiv=\"content-type\" content=\"text/html; charset=utf-8\">"+newicon+"<style>body{padding-left:2em;text-indent:-2em;font-family:monospace}.description,.message :is(.time,.binary,.pid,.line){font-size:.9em;color:#777}.message:is([data-debuglevel=\"WARN\"],[data-debuglevel=\"ERROR\"],[data-debuglevel=\"FAIL\"]){font-weight:bold;}</style></head><body></body></html>");
+          tab.document.close();
+        }
+        else {
+          console.log("Failed to open new tab");
+        }
+      }
 
       return $("<section>").addClass("logs").append(
         $("<h3>").text("MistServer logs")
       ).append(
         $("<button>").text("Open raw").click(function(){
-          tab = window.open("", "MistServer logs"+(streamname ? " for "+streamname : ""));
-          tab.document.write(
-            "<html><head><title>MistServer logs"+(streamname ? " for '"+streamname+"'" : "")+"</title><meta http-equiv=\"content-type\" content=\"application/json; charset=utf-8\"><style>body{padding-left:2em;text-indent:-2em;font-family:monospace}.description,.message :is(.time,.binary,.pid,.line){font-size:.9em;color:#777}.message:is([data-debuglevel=\"WARN\"],[data-debuglevel=\"ERROR\"],[data-debuglevel=\"FAIL\"]){font-weight:bold;}</style></head><body>"
-          );
-          tab.document.write($logs[0].innerHTML);
-          tab.document.scrollingElement.scrollTop = tab.document.scrollingElement.scrollHeight;
+          newRawTab();
+          if (tab) {
+            tab.document.body.innerHTML = $logs[0].innerHTML;
+            tab.document.scrollingElement.scrollTop = tab.document.scrollingElement.scrollHeight;
+          }
         })
       ).append(
         $logs
@@ -17551,10 +17774,10 @@ if (!('origin' in location)) {
 }
 var host;
 if (location.origin == 'file://') {
-  host = 'http://localhost:4242/api';
+  host = 'http://localhost:4242/';
 }
 else {
-  host = location.origin+location.pathname.replace(/\/+$/, "")+'/api';
+  host = location.origin+location.pathname.replace(/\/+$/, "");
 }
 var mist = {
   data: {},
@@ -17579,7 +17802,7 @@ var mist = {
     $.extend(true,data,sendData);
     log('Send',$.extend(true,{},sendData));
     var obj = {
-      url: mist.user.host,
+      url: mist.getApiUrl({pathname:"/api"}),
       type: 'POST',
       contentType: "application/json",
       data: JSON.stringify(data),

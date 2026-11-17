@@ -104,7 +104,7 @@ namespace Mist {
 
   OutTSSRT::OutTSSRT(Socket::Connection & conn, Util::Config & _cfg, JSON::Value & _capa, Socket::SRTConnection *_srtSock)
     : TSOutput(conn, _cfg, _capa) {
-    closeMyConn();
+    myConn.close();
     srtConn = _srtSock;
     // NOTE: conn is useless for SRT, as it uses a different socket type.
     sendRepeatingHeaders = 500; // PAT/PMT every 500ms (DVB spec)
@@ -138,7 +138,8 @@ namespace Mist {
         }
       }
 
-      target = HTTP::URL(config->getString("target"));
+      JSON::Value & targetOpt = config->getOption("target", true);
+      target = HTTP::URL(targetOpt.lastElem().asStringRef());
 
       std::deque<Socket::Address> remoteAddr = Socket::getAddrs(remoteIP, remotePort);
       std::deque<Socket::Address> localAddr = Socket::getAddrs(target.host, target.getPort());
@@ -147,7 +148,12 @@ namespace Mist {
         HTTP::URL newTgt = target;
         newTgt.host = remoteIP;
         newTgt.port = std::to_string(remotePort);
-        config->getOption("target", true).append(newTgt.getUrl());
+        targetOpt.append(newTgt.getUrl());
+        if (getenv("MST_ORIG_TARGET")) {
+          std::string origTarget = getenv("MST_ORIG_TARGET");
+          origTarget += " (accepted on)";
+          setenv("MST_ORIG_TARGET", origTarget.c_str(), 1);
+        }
       }
 
       // Create UDP socket
@@ -846,6 +852,9 @@ namespace Mist {
     statComm.setPacketCount(srtConn->packetCount());
     statComm.setPacketLostCount(srtConn->packetLostCount());
     statComm.setPacketRetransmitCount(srtConn->packetRetransmitCount());
+    statComm.setPacketRecoverCount(srtConn->packetRecoverCount());
+    statComm.setRoundTripTime(srtConn->RTT());
+    statComm.setLatency(srtConn->Latency());
   }
 
   bool OutTSSRT::listenMode(Util::Config *config) {

@@ -43,12 +43,17 @@ bool Util::Config::is_restarting = false;
 static int serv_sock_fd = -1;
 uint32_t Util::printDebugLevel = DEBUG;
 __thread char Util::streamName[256] = {0};
+__thread char Util::UUID[64] = {0};
 __thread char Util::exitReason[256] = {0};
 __thread char* Util::mRExitReason = (char*)ER_UNKNOWN;
 Util::binType Util::Config::binaryType = UNSET;
 
 void Util::setStreamName(const std::string & sn){
   strncpy(Util::streamName, sn.c_str(), 256);
+}
+
+void Util::setUUID(const std::string & UUID) {
+  strncpy(Util::UUID, UUID.c_str(), 64);
 }
 
 void Util::logExitReason(const char *shortString, const char *format, ...) {
@@ -625,6 +630,13 @@ void Util::Config::activate(){
   if (cur_action.sa_handler == SIG_DFL || cur_action.sa_handler == SIG_IGN){
     new_action.sa_handler = SIG_IGN;
     sigaction(SIGCHLD, &new_action, NULL);
+  }
+  // Check if a USR2 signal handler exists. If not, ignore that signal (default is terminate).
+  sigaction(SIGUSR2, 0, &cur_action);
+  if (cur_action.sa_handler == SIG_DFL) {
+    new_action.sa_flags = 0;
+    new_action.sa_handler = SIG_IGN;
+    sigaction(SIGUSR2, &new_action, NULL);
   }
   is_active = true;
 }

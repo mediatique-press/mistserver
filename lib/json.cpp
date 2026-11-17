@@ -15,6 +15,7 @@
 #include <string.h> //for memcpy
 
 const JSON::Value nullObj;
+JSON::Value shouldBeNullObj;
 
 /// Construct from a root Value to iterate over.
 JSON::Iter::Iter(Value &root){
@@ -758,6 +759,16 @@ JSON::Value::Value(bool val){
   intVal = (val ? 1 : 0);
 }
 
+JSON::Value::Value(JSON::object, std::initializer_list<std::pair<std::string, Value>> values) {
+  myType = OBJECT;
+  for (auto it : values) (*this)[it.first] = it.second;
+}
+
+JSON::Value::Value(JSON::array, std::initializer_list<Value> values) {
+  myType = ARRAY;
+  for (auto it : values) append(it);
+}
+
 #ifdef SIZET_VARIANT
 /// Sets this JSON::Value to the given integer.
 JSON::Value::Value(size_t val){
@@ -1101,6 +1112,20 @@ JSON::Value &JSON::Value::operator[](uint32_t i){
   return *arrVal[i];
 }
 
+JSON::Value & JSON::Value::firstElem() {
+  if (myType == OBJECT && objVal.size()) { return *objVal.begin()->second; }
+  if (myType == ARRAY && arrVal.size()) { return **arrVal.begin(); }
+  shouldBeNullObj.null();
+  return shouldBeNullObj;
+}
+
+JSON::Value & JSON::Value::lastElem() {
+  if (myType == OBJECT && objVal.size()) { return *objVal.rbegin()->second; }
+  if (myType == ARRAY && arrVal.size()) { return **arrVal.rbegin(); }
+  shouldBeNullObj.null();
+  return shouldBeNullObj;
+}
+
 /// Retrieves the JSON::Value at this position in the object.
 /// Fails horribly if that values does not exist.
 const JSON::Value &JSON::Value::operator[](const std::string &i) const{
@@ -1120,6 +1145,18 @@ const JSON::Value & JSON::Value::operator[](const char *i) const {
 const JSON::Value & JSON::Value::operator[](uint32_t i) const {
   if (arrVal.size() <= i) { return nullObj; }
   return *arrVal[i];
+}
+
+const JSON::Value & JSON::Value::firstElem() const {
+  if (myType == OBJECT && objVal.size()) { return *objVal.begin()->second; }
+  if (myType == ARRAY && arrVal.size()) { return **arrVal.begin(); }
+  return nullObj;
+}
+
+const JSON::Value & JSON::Value::lastElem() const {
+  if (myType == OBJECT && objVal.size()) { return *objVal.rbegin()->second; }
+  if (myType == ARRAY && arrVal.size()) { return **arrVal.rbegin(); }
+  return nullObj;
 }
 
 /// Converts the type of the JSON::Value to string if needed, then appends the given string to it and returns it by reference.
