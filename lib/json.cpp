@@ -15,7 +15,7 @@
 #include <string.h> //for memcpy
 
 const JSON::Value nullObj;
-JSON::Value shouldBeNullObj;
+static JSON::Value shouldBeNullObj; // internal linkage: test/json.cpp #includes this file and also links libmist
 
 /// Construct from a root Value to iterate over.
 JSON::Iter::Iter(Value &root){
