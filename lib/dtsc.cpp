@@ -5,8 +5,8 @@
 
 #include "adts.h"
 #include "bitfields.h"
+#include "config.h"
 #include "defines.h"
-#include "encode.h"
 #include "h264.h"
 #include "h265.h"
 #include "langcodes.h"
@@ -1026,8 +1026,8 @@ namespace DTSC{
     }else{
       sBufShm(_streamName, DEFAULT_TRACK_COUNT, master, autoBackOff);
     }
-    if (isMaster || stream.isReady()) { streamInit(); }
-    if (isMaster){
+    streamInit();
+    if (isMaster && !stream.isReady()) {
       stream.setReady();
       trackList.setReady();
     }
@@ -1073,6 +1073,7 @@ namespace DTSC{
 
     setVod(src.hasMember("vod") && src.getMember("vod").asInt());
     setLive(src.hasMember("live") && src.getMember("live").asInt());
+    setUUID(src.hasMember("uuid") ? src.getMember("uuid").asString() : "");
 
     version = src.getMember("version").asInt();
 
@@ -1275,12 +1276,13 @@ namespace DTSC{
   /// Regardless, afterwards the internal RelAccXFieldData members are updated with their correct
   /// values.
   void Meta::streamInit(size_t trackCount){
-    if (isMaster){
+    if (isMaster && !stream.isReady()) {
       ///\todo Add safety for non-initialized stream object;
       stream.addField("vod", RAX_UINT);
       stream.addField("live", RAX_UINT);
       stream.addField("tracks", RAX_NESTED, META_TRACK_OFFSET + (trackCount * META_TRACK_RECORDSIZE));
       stream.addField("source", RAX_STRING, 512);
+      stream.addField("uuid", RAX_STRING, 64);
       stream.addField("maxkeepaway", RAX_16UINT);
       stream.addField("bufferwindow", RAX_64UINT);
       stream.addField("bootmsoffset", RAX_64INT);
@@ -1308,7 +1310,7 @@ namespace DTSC{
 
       trackList.setRCount(trackCount);
       preloadTrackFields();
-    }else{
+    } else {
       if (stream.isReady()){streamTracksField = stream.getFieldData("tracks");}
       refresh();
     }
@@ -1424,11 +1426,12 @@ namespace DTSC{
   /// already populated.
   void Meta::refresh(){
     if (!stream.isReady() || !stream.getPointer(streamTracksField)){
-      INFO_MSG("No track pointer, not refreshing.");
+      HIGH_MSG("No track pointer, not refreshing.");
       return;
     }
     trackList = Util::RelAccX(stream.getPointer(streamTracksField), false);
     preloadTrackFields();
+    Util::setUUID(getUUID());
     for (size_t i = 0; i < trackList.getPresent(); i++){
       if (trackList.getInt(trackValidField, i) == 0){continue;}
       if (tracks.count(i)){continue;}
@@ -1497,6 +1500,16 @@ namespace DTSC{
         t.pageFirstTimeField = t.pages.getFieldData("firsttime");
       }
     }
+  }
+
+  /// Returns true if none of the shared memory pages for this stream were deleted
+  bool Meta::exists() const {
+    if (isMemBuf) { return true; }
+    if (!streamPage.exists()) { return false; }
+    for (std::map<size_t, IPC::sharedPage>::const_iterator it = tM.begin(); it != tM.end(); ++it) {
+      if (!it->second.exists()) { return false; }
+    }
+    return true;
   }
 
   /// Reloads shared memory pages that are marked as needing an update, if any
@@ -1988,15 +2001,15 @@ namespace DTSC{
     do {
       for (const size_t & T : V) {
         if (getType(T) != trkDta.type) {
-          INFO_MSG("T%zu: Type mismatch", T);
+          DONTEVEN_MSG("T%zu: Type mismatch", T);
           continue;
         }
         if (getCodec(T) != trkDta.codec) {
-          INFO_MSG("T%zu: Codec mismatch", T);
+          DONTEVEN_MSG("T%zu: Codec mismatch", T);
           continue;
         }
         if (getInit(T) != trkDta.init) {
-          INFO_MSG("T%zu: Init mismatch", T);
+          DONTEVEN_MSG("T%zu: Init mismatch", T);
           continue;
         }
         if (trkDta.type == "audio") {
@@ -2006,11 +2019,11 @@ namespace DTSC{
         }
         if (trkDta.type == "video") {
           if (getWidth(T) != trkDta.width) {
-            INFO_MSG("T%zu: Width mismatch", T);
+            DONTEVEN_MSG("T%zu: Width mismatch", T);
             continue;
           }
           if (getHeight(T) != trkDta.height) {
-            INFO_MSG("T%zu: Height mismatch", T);
+            DONTEVEN_MSG("T%zu: Height mismatch", T);
             continue;
           }
           // We don't care about fpks since it can vary sometimes, as long as the init data is the same we're fine with it
@@ -2589,7 +2602,13 @@ namespace DTSC{
   }
   uint64_t Meta::getLastms(size_t trackIdx) const{
     const DTSC::Track &t = tracks.at(trackIdx);
-    if (isLimited && limitMax < t.track.getInt(t.trackLastmsField)){return limitMax;}
+    if (isLimited) {
+      uint64_t trkLimit = limitMax;
+      if (limitTrkMax.size() >= (trackIdx + 1) * sizeof(uint64_t)) {
+        trkLimit = ((const uint64_t *)(const char *)limitTrkMax)[trackIdx];
+      }
+      if (trkLimit < t.track.getInt(t.trackLastmsField)) { return trkLimit; }
+    }
     return t.track.getInt(t.trackLastmsField);
   }
 
@@ -2602,6 +2621,7 @@ namespace DTSC{
     if (t.track.getInt(t.trackNowmsField) < nowms) { t.track.setInt(t.trackNowmsField, nowms); }
   }
   uint64_t Meta::getNowms(size_t trackIdx) const{
+    if (isLimited) { return getLastms(trackIdx); }
     const DTSC::Track &t = tracks.find(trackIdx)->second;
     return t.track.getInt(t.trackNowmsField);
   }
@@ -2757,14 +2777,23 @@ namespace DTSC{
     stream.setInt(streamVodField, vod ? 1 : 0);
   }
   bool Meta::getVod() const{
-    return isLimited || stream.getInt(streamVodField);
+    return isLimited || (stream.isReady() && stream.getInt(streamVodField));
   }
 
   void Meta::setLive(bool live){
     stream.setInt(streamLiveField, live ? 1 : 0);
   }
   bool Meta::getLive() const{
-    return (!isLimited || limitMax == 0xFFFFFFFFFFFFFFFFull) && stream.getInt(streamLiveField);
+    return (!isLimited || limitMax == 0xFFFFFFFFFFFFFFFFull) && stream.isReady() && stream.getInt(streamLiveField);
+  }
+
+  void Meta::setUUID(std::string uuid) {
+    stream.setString("uuid", uuid);
+    Util::setUUID(uuid);
+  }
+
+  std::string Meta::getUUID() const {
+    return stream.getPointer("uuid");
   }
 
   bool Meta::hasBFrames(size_t idx) const{
@@ -2878,7 +2907,7 @@ namespace DTSC{
     }
   }
 
-  /// Removes the track from the memory structure and caches.
+  /// Removes the track from the memory structure.
   void Meta::removeTrack(size_t trackIdx){
     if (!getValidTracks().count(trackIdx)){return;}
     if (trackInvalidateCallback) { trackInvalidateCallback(trackIdx); }
@@ -2889,7 +2918,7 @@ namespace DTSC{
         char thisPageName[NAME_BUFFER_SIZE];
         snprintf(thisPageName, NAME_BUFFER_SIZE, SHM_TRACK_DATA, streamName.c_str(), trackIdx,
                  (uint32_t)t.pages.getInt(t.pageFirstKeyField, i));
-        IPC::sharedPage p(thisPageName, 20971520);
+        IPC::sharedPage p(thisPageName, DEFAULT_DATA_PAGE_SIZE, false, false);
         p.master = true;
       }
     }
@@ -2900,7 +2929,7 @@ namespace DTSC{
     trackList.setInt(trackValidField, 0, trackIdx);
   }
 
-  /// Removes the first key from the memory structure and caches.
+  /// Removes the first key from the memory structure.
   bool Meta::removeFirstKey(size_t trackIdx){
     if (!isMemBuf && reloadReplacedPagesIfNeeded()) {
       MEDIUM_MSG("Metadata just got replaced, delaying deletion of key a bit");
@@ -2936,9 +2965,8 @@ namespace DTSC{
       // Delete the page if this was the last key on it
       if (tPages.getInt("avail", firstPage)){
         // Open the page itself
-        char pageId[NAME_BUFFER_SIZE];
-        snprintf(pageId, NAME_BUFFER_SIZE, SHM_TRACK_DATA, streamName.c_str(), trackIdx, firstKey);
-        std::string pageName(pageId);
+        char pageName[NAME_BUFFER_SIZE];
+        snprintf(pageName, NAME_BUFFER_SIZE, SHM_TRACK_DATA, streamName.c_str(), trackIdx, firstKey);
         IPC::sharedPage toErase;
         toErase.init(pageName, 0, false, false);
         // Set the master flag so that the page will be destroyed once it leaves scope
@@ -3151,10 +3179,8 @@ namespace DTSC{
           resizeTrack(tNumber, t.fragments.getRCount() * 2, t.keys.getRCount(), t.parts.getRCount(), t.pages.getRCount(), "not enough frags");
         }
         if (newFragNum){
-          t.fragments.setInt(t.fragmentDurationField,
-                             packTime - t.keys.getInt(t.keyTimeField, t.fragments.getInt(t.fragmentFirstKeyField,
-                                                                                         newFragNum - 1)),
-                             newFragNum - 1);
+          uint64_t d = t.keys.getInt(t.keyTimeField, t.fragments.getInt(t.fragmentFirstKeyField, newFragNum - 1));
+          t.fragments.setInt(t.fragmentDurationField, packTime - d, newFragNum - 1);
 
           uint64_t totalBytes = 0;
           uint64_t totalDuration = 0;
@@ -3182,10 +3208,8 @@ namespace DTSC{
     }else{
       //not a keyframe
       uint64_t lastKeyNum = t.keys.getEndPos() - 1;
-      t.keys.setInt(t.keyDurationField,
-                    t.keys.getInt(t.keyDurationField, lastKeyNum) +
-                        t.parts.getInt(t.partDurationField, newPartNum - 1),
-                    lastKeyNum);
+      uint64_t d = t.keys.getInt(t.keyDurationField, lastKeyNum) + t.parts.getInt(t.partDurationField, newPartNum - 1);
+      t.keys.setInt(t.keyDurationField, d, lastKeyNum);
     }
 
     uint64_t lastKeyNum = t.keys.getEndPos() - 1;
@@ -3194,6 +3218,10 @@ namespace DTSC{
     uint64_t lastFragNum = t.fragments.getEndPos() - 1;
     t.fragments.setInt(t.fragmentSizeField,
                        t.fragments.getInt(t.fragmentSizeField, lastFragNum) + packDataSize, lastFragNum);
+    if (!getLive()) {
+      uint64_t d = t.keys.getInt(t.keyTimeField, t.fragments.getInt(t.fragmentFirstKeyField, lastFragNum));
+      t.fragments.setInt(t.fragmentDurationField, packTime - d, lastFragNum);
+    }
     t.track.setInt(t.trackLastmsField, packTime);
     t.track.setInt(t.trackNowmsField, packTime);
     markUpdated(tNumber);
@@ -3502,17 +3530,17 @@ namespace DTSC{
     if (getLive() || getUTCOffset()){dataLen += 19;} // unixzero field
     for (const auto & it : tracks) {
       if (!it.second.parts.getPresent()) { continue; }
-      if (!selectedTracks.size() || selectedTracks.count(it.first)) {
-        dataLen += (124 + getInit(it.first).size() + getCodec(it.first).size() + getType(it.first).size() +
-                    getTrackIdentifier(it.first, true).size());
-        if (!skipDynamic){
-          dataLen += ((it.second.fragments.getPresent() * DTSH_FRAGMENT_SIZE) + 16);
-          dataLen += ((it.second.keys.getPresent() * DTSH_KEY_SIZE) + 11);
-          dataLen += ((it.second.keys.getPresent() * 4) + 15);
-          dataLen += ((it.second.parts.getPresent() * DTSH_PART_SIZE) + 12);
-          //          dataLen += ivecs.size() * 8 + 12; /*LTS*/
-          if (it.second.track.getInt("missedFrags")) { dataLen += 23; }
-        }
+      if (selectedTracks.size() && !selectedTracks.count(it.first)) { continue; }
+      dataLen += (124 + getInit(it.first).size() + getCodec(it.first).size() + getType(it.first).size() +
+                  getTrackIdentifier(it.first, true).size());
+      if (!skipDynamic) {
+        dataLen += ((it.second.fragments.getPresent() * DTSH_FRAGMENT_SIZE) + 16);
+        dataLen += ((it.second.keys.getPresent() * DTSH_KEY_SIZE) + 11);
+        dataLen += ((it.second.keys.getPresent() * 4) + 15);
+        dataLen += ((it.second.parts.getPresent() * DTSH_PART_SIZE) + 12);
+        // dataLen += ivecs.size() * 8 + 12; /*LTS*/
+        if (it.second.track.getInt("missedFrags")) { dataLen += 23; }
+      }
         if (reID && getSourceTrack(it.first) != INVALID_TRACK_ID) { dataLen += 17; }
         std::string lang = getLang(it.first);
         if (lang.size() && lang != "und"){dataLen += 11 + lang.size();}
@@ -3521,13 +3549,13 @@ namespace DTSC{
         } else if (getType(it.first) == "video") {
           dataLen += 64;
         }
-      }
     }
     /*
     if (sourceURI.size()){
       dataLen += 13 + sourceURI.size();
     }
     */
+    if (getUUID().size()) { dataLen += 11 + getUUID().size(); }
     return dataLen + 8; // add 8 bytes header
   }
 
@@ -3729,6 +3757,7 @@ namespace DTSC{
     } else {
       if (getUTCOffset()) { res["unixoffset"] = getUTCOffset(); }
     }
+    if (getUUID().size()) { res["uuid"] = getUUID(); }
     res["version"] = DTSH_VERSION;
     if (getBufferWindow()){res["buffer_window"] = getBufferWindow();}
     if (getSource() != ""){res["source"] = getSource();}
@@ -3774,17 +3803,24 @@ namespace DTSC{
       conn.SendNow(c32(lVars.size()), 4);
       conn.SendNow(lVars.data(), lVars.size());
     }
+    if (getUUID().size()) {
+      conn.SendNow("\000\004uuid\002", 7);
+      conn.SendNow(c32(getUUID().size()), 4);
+      conn.SendNow(getUUID().data(), getUUID().size());
+    }
     conn.SendNow("\000\006tracks\340", 9);
-    for (std::set<size_t>::const_iterator it = selectedTracks.begin(); it != selectedTracks.end(); it++){
-      std::string tmp = getTrackIdentifier(*it, true);
+    for (const auto & T : tracks) {
+      if (!T.second.parts.getPresent()) { continue; }
+      if (selectedTracks.size() && !selectedTracks.count(T.first)) { continue; }
+      std::string tmp = getTrackIdentifier(T.first, true);
       conn.SendNow(c16(tmp.size()), 2);
       conn.SendNow(tmp.data(), tmp.size());
       conn.SendNow("\340", 1); // Begin track object
 
       if (!skipDynamic){
-        const Util::RelAccX &fragments = tracks.at(*it).fragments;
-        const Util::RelAccX &keys = tracks.at(*it).keys;
-        const Util::RelAccX &parts = tracks.at(*it).parts;
+        const Util::RelAccX & fragments = tracks.at(T.first).fragments;
+        const Util::RelAccX & keys = tracks.at(T.first).keys;
+        const Util::RelAccX & parts = tracks.at(T.first).parts;
 
         size_t fragBegin = fragments.getStartPos();
         size_t fragCount = fragments.getPresent();
@@ -3827,13 +3863,13 @@ namespace DTSC{
         }
       }
 
-      const Util::RelAccX &track = tracks.at(*it).track;
+      const Util::RelAccX & track = tracks.at(T.first).track;
       conn.SendNow("\000\007trackid\001", 10);
       if (reID){
-        conn.SendNow(c64((*it) + 1), 8);
-        if (getSourceTrack(*it) != INVALID_TRACK_ID) {
+        conn.SendNow(c64((T.first) + 1), 8);
+        if (getSourceTrack(T.first) != INVALID_TRACK_ID) {
           conn.SendNow("\000\006source\001", 9);
-          conn.SendNow(c64(getSourceTrack(*it) + 1), 8);
+          conn.SendNow(c64(getSourceTrack(T.first) + 1), 8);
         }
       }else{
         conn.SendNow(c64(track.getInt("id")), 8);
@@ -3855,24 +3891,24 @@ namespace DTSC{
       conn.SendNow("\000\006maxbps\001", 9);
       conn.SendNow(c64(track.getInt("maxbps")), 8);
 
-      tmp = getInit(*it);
+      tmp = getInit(T.first);
       conn.SendNow("\000\004init\002", 7);
       conn.SendNow(c32(tmp.size()), 4);
       conn.SendNow(tmp.data(), tmp.size());
 
-      tmp = getCodec(*it);
+      tmp = getCodec(T.first);
       conn.SendNow("\000\005codec\002", 8);
       conn.SendNow(c32(tmp.size()), 4);
       conn.SendNow(tmp.data(), tmp.size());
 
-      tmp = getLang(*it);
+      tmp = getLang(T.first);
       if (tmp.size() && tmp != "und"){
         conn.SendNow("\000\004lang\002", 7);
         conn.SendNow(c32(tmp.size()), 4);
         conn.SendNow(tmp.data(), tmp.size());
       }
 
-      tmp = getType(*it);
+      tmp = getType(T.first);
       conn.SendNow("\000\004type\002", 7);
       conn.SendNow(c32(tmp.size()), 4);
       conn.SendNow(tmp.data(), tmp.size());
@@ -3913,17 +3949,19 @@ namespace DTSC{
   /// Returns true if the given track index is marked as valid. For this the track does not have to
   /// be loaded as well
   uint8_t Meta::trackValid(size_t idx) const{
-    if (idx > trackList.getPresent()){return 0;}
+    if (!trackList.isReady() || idx > trackList.getPresent()) { return 0; }
     return trackList.getInt(trackValidField, idx);
   }
 
   /// Returns the current highest track index (zero-based).
-  size_t Meta::trackCount() const{return trackList.getPresent();}
+  size_t Meta::trackCount() const {
+    return trackList.isReady() ? trackList.getPresent() : 0;
+  }
 
   /// Returns the index the first video track, or the first track.
   /// Will print a WARN-level message if there are no tracks.
   size_t Meta::mainTrack() const{
-    if (!trackList.getPresent()){return INVALID_TRACK_ID;}
+    if (!trackList.isReady() || !trackList.getPresent()) { return INVALID_TRACK_ID; }
     std::set<size_t> validTracks = getValidTracks();
     size_t currentTrack = INVALID_TRACK_ID;
     for (std::set<size_t>::iterator it = validTracks.begin(); it != validTracks.end(); it++){
@@ -4120,12 +4158,36 @@ namespace DTSC{
     const Track & t = tracks.at(idx);
     const Util::RelAccX & pages = t.pages;
     size_t res = pages.getStartPos();
-    for (size_t i = pages.getStartPos(); i < pages.getEndPos(); ++i){
+    for (size_t i = res; i < pages.getEndPos(); ++i) {
       if (pages.getInt(t.pageAvailField, i) == 0) { continue; }
       if (pages.getInt(t.pageFirstKeyField, i) > keyNum) { break; }
       res = i;
     }
     return pages.getInt(t.pageFirstKeyField, res);
+  }
+
+  /// Given a key, returns the page index it can be found on.
+  /// If the key is not available, returns the closest page that is.
+  size_t Meta::getPageIndexForKey(uint32_t idx, uint64_t keyNum) const {
+    const Track & t = tracks.at(idx);
+    const Util::RelAccX & pages = t.pages;
+    size_t res = pages.getStartPos();
+    for (size_t i = res; i < pages.getEndPos(); ++i) {
+      if (pages.getInt(t.pageAvailField, i) == 0) { continue; }
+      if (pages.getInt(t.pageFirstKeyField, i) > keyNum) { break; }
+      res = i;
+    }
+    return res;
+  }
+
+  /// Given a key, returns the page number it can be found on, even if the key is not available.
+  size_t Meta::getPageIndexForKeyExact(uint32_t idx, uint64_t keyNum) const {
+    const Track & t = tracks.at(idx);
+    const Util::RelAccX & pages = t.pages;
+    for (size_t i = pages.getStartPos(); i < pages.getEndPos(); ++i) {
+      if (pages.getInt(t.pageFirstKeyField, i) == keyNum) return i;
+    }
+    return INVALID_KEY_NUM;
   }
 
   /// Returns the key number containing a given time.
@@ -4307,6 +4369,16 @@ namespace DTSC{
     isLimited = true;
     limitMin = min;
     limitMax = max;
+
+    uint64_t endPos = trackList.getEndPos();
+    limitTrkMax.appendNull(sizeof(uint64_t) * endPos);
+    for (size_t i = 0; i < endPos; ++i) {
+      DTSC::Keys keys(getKeys(i));
+      size_t lastKey = keys.getEndValid() - 1;
+      size_t lastPart = keys.getFirstPart(lastKey) + keys.getParts(lastKey) - 1;
+      ((uint64_t *)(char *)limitTrkMax)[i] = getPartTime(lastPart, i);
+      HIGH_MSG("Track %zu limited from %" PRIu64 " to %" PRIu64, i, min, ((uint64_t *)(char *)limitTrkMax)[i]);
+    }
     INFO_MSG("Applied limiter from %" PRIu64 " to %" PRIu64, min, max);
   }
 

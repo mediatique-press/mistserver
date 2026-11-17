@@ -243,7 +243,6 @@ namespace Mist{
     void streamMainLoop(){
       uint64_t statTimer = 0;
       uint64_t startTime = Util::bootSecs();
-      Comms::Connections statComm;
       while (config->is_active){
         // Get current frame time
         {
@@ -273,6 +272,7 @@ namespace Mist{
           frameReady = false;
         }
         avCV.notify_all();
+        evLp.await(0);
 
         if (!userSelect.count(thisIdx)) { userSelect[thisIdx].reload(streamName, thisIdx, sinkCommState); }
         if (userSelect[thisIdx].getStatus() & COMM_STATUS_REQDISCONNECT){
@@ -450,7 +450,7 @@ namespace Mist{
 
     ProcessSource(Socket::Connection & c, Util::Config & _cfg, JSON::Value & _capa) : Output(c, _cfg, _capa) {
       meta.ignorePid(getpid());
-      closeMyConn();
+      myConn.close();
 
       if (isVideo) {
         targetParams["audio"] = "none";

@@ -10,6 +10,7 @@
 #include <mist/socket_srt.h>
 #include <mist/stream.h>
 #include <mist/timing.h>
+#include <mist/triggers.h>
 #include <mist/ts_packet.h>
 #include <mist/util.h>
 
@@ -174,6 +175,15 @@ namespace Mist{
       }
       Util::sanitizeName(streamName);
       Util::setStreamName(streamName);
+      // Handle CONN_OPEN trigger, if needed
+      if (Triggers::shouldTrigger("CONN_OPEN", streamName)) {
+        std::string payload = streamName + "\n" + srtConn->remoteaddr.host() + "\n" + capa["name"].asStringRef() + "\n" + streamid;
+        if (!Triggers::doTrigger("CONN_OPEN", payload, streamName)) {
+          WARN_MSG("Incoming connection denied by CONN_OPEN trigger");
+          srtConn->close();
+          srtConn = 0;
+        }
+      }
       armIdleWatchdog();
     }
     lastTimeStamp = 0;
@@ -194,6 +204,18 @@ namespace Mist{
   }
 
   InputTSSRT::~InputTSSRT(){}
+
+  /// Cleans up any left-over data for the current stream
+  void InputTSSRT::onCrash() {
+    WARN_MSG("SRT input crashed. Cleaning.");
+    streamName = config->getString("streamname");
+    // Wipe pull semaphore
+    {
+      IPC::semaphore pullLock;
+      pullLock.open(std::string("/MstPull_" + streamName).c_str(), O_CREAT | O_RDWR, ACCESSPERMS, 1);
+      pullLock.unlink();
+    }
+  }
 
   bool InputTSSRT::checkArguments(){
     if (config->getString("datatrack") == "json"){
@@ -443,11 +465,15 @@ namespace Mist{
   void InputTSSRT::setSingular(bool newSingular){singularFlag = newSingular;}
 
   void InputTSSRT::connStats(Comms::Connections &statComm){
+    srtConn->connTime();
     statComm.setUp(srtConn->dataUp());
     statComm.setDown(srtConn->dataDown());
     statComm.setPacketCount(srtConn->packetCount());
     statComm.setPacketLostCount(srtConn->packetLostCount());
     statComm.setPacketRetransmitCount(srtConn->packetRetransmitCount());
+    statComm.setPacketRecoverCount(srtConn->packetRecoverCount());
+    statComm.setRoundTripTime(srtConn->RTT());
+    statComm.setLatency(srtConn->Latency());
   }
 
 }// namespace Mist

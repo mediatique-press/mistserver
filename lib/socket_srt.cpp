@@ -340,8 +340,6 @@ namespace Socket{
     }else{
       lastGood = Util::bootMS();
     }
-
-    srt_bstats(sock, &performanceMonitor, false);
     return receivedBytes;
   }
 
@@ -435,7 +433,6 @@ namespace Socket{
     }else{
       lastGood = Util::bootMS();
     }
-    srt_bstats(sock, &performanceMonitor, false);
     return receivedBytes;
   }
 
@@ -581,7 +578,6 @@ namespace Socket{
     }else{
       lastGood = Util::bootMS();
     }
-    srt_bstats(sock, &performanceMonitor, false);
   }
 
   unsigned int SRTConnection::connTime(){
@@ -593,17 +589,32 @@ namespace Socket{
 
   uint64_t SRTConnection::dataDown(){return performanceMonitor.byteRecvTotal;}
 
-  uint64_t SRTConnection::packetCount(){
-    return (direction == "output" ? performanceMonitor.pktSentTotal : performanceMonitor.pktRecvTotal);
+  uint64_t SRTConnection::packetCount() {
+    return direction == "output" ? performanceMonitor.pktSentUniqueTotal : performanceMonitor.pktRecvUniqueTotal;
   }
 
-  uint64_t SRTConnection::packetLostCount(){
-    return (direction == "output" ? performanceMonitor.pktSndLossTotal : performanceMonitor.pktRcvLossTotal);
+  uint64_t SRTConnection::packetLostCount() {
+    return direction == "output" ? performanceMonitor.pktSndLossTotal + performanceMonitor.pktSndDropTotal
+                                 : performanceMonitor.pktRcvLossTotal + performanceMonitor.pktRcvDropTotal;
   }
 
-  uint64_t SRTConnection::packetRetransmitCount(){
-    //\todo This should be updated with pktRcvRetransTotal on the retrieving end once srt has implemented this.
-    return (direction == "output" ? performanceMonitor.pktRetransTotal : 0);
+  uint64_t SRTConnection::packetRetransmitCount() {
+    return direction == "output" ? performanceMonitor.pktRetransTotal : performanceMonitor.pktRcvRetrans;
+  }
+
+  /// Returns count of packets recovered by FEC. Only available on receiver side.
+  uint64_t SRTConnection::packetRecoverCount() {
+    return direction == "output" ? 0 : performanceMonitor.pktRcvFilterSupplyTotal;
+  }
+
+  /// Returns calculated estimate of current RTT.
+  uint16_t SRTConnection::RTT() {
+    return performanceMonitor.msRTT;
+  }
+
+  /// Returns negotiated latency.
+  uint16_t SRTConnection::Latency() {
+    return performanceMonitor.msSndTsbPdDelay;
   }
 
   void SRTConnection::initializeEmpty(){
@@ -720,6 +731,7 @@ namespace Socket{
 #ifdef HAS_SRT_SHUTDOWN
       if (srt_getsockstate(sock) == SRTS_SHUTDOWN) { closedByRemote = true; }
 #endif
+      srt_bstats(sock, &performanceMonitor, false);
       HIGH_MSG("Closing SRT socket %d (state = %s)", sock, getStateStr());
       setBlocking(true);
       srt_close(sock);

@@ -89,7 +89,7 @@ namespace Mist {
 
       ProcessSource(Socket::Connection & c, Util::Config & cfg, JSON::Value & capa) : Output(c, cfg, capa) {
         lastSelCheck = Util::bootMS();
-        closeMyConn();
+        myConn.close();
         targetParams["keeptimes"] = true;
         realTime = 0;
         wantRequest = true;
@@ -530,7 +530,6 @@ namespace Mist {
         memset(delaySeen, 0, sizeof(delaySeen)); // null all delays so far
         size_t delayCounter{0};
         thisIdx = INVALID_TRACK_ID;
-        Comms::Connections statComm;
 
         Util::ResizeablePointer outPtr;
 
@@ -1146,7 +1145,7 @@ namespace Mist {
           } // Scope for drawMutex
 
           if (!targetFPS && !changed && nowMs < vidLastMs + 500) {
-            Util::sleep(10);
+            evLp.await(10);
             continue;
           }
 
@@ -1174,7 +1173,7 @@ namespace Mist {
               connStats(statComm);
             }
           }
-          if (targetFPS) { Util::sleep(frameIntervalMs); }
+          if (targetFPS) { evLp.await(frameIntervalMs); }
         }
       }
 
